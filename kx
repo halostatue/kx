@@ -1,0 +1,1166 @@
+#!/usr/bin/env bash
+# vim: ft=bash tw=80
+
+# If KX_HOME is already set, use that value.
+KX_HOME="${KX_HOME:-${HOME}/.kx}"
+export KX_HOME
+
+declare bn0 base_path bin_path kx_path build_path scripts_path elixirs_path \
+  elixirs_source_path mix_archives_path mix_archives_source_path kx_url \
+  cached_release_list cached_branch_list user_agent system usershell distro \
+  quiet verbose force install_kx kx_version update KX_REPO
+declare -a auth_header
+
+KX_REPO=${KX_REPO:-elixir-lang/elixir}
+kx_version="2.0.0"
+bn0="$(basename "${0}")"
+base_path="${KX_HOME}"
+bin_path="${base_path}/bin"
+kx_path="${bin_path}/kx"
+build_path="${base_path}/builds"
+scripts_path="${base_path}/scripts"
+elixirs_path="${base_path}/elixirs"
+mix_archives_path="${base_path}/mix/archives"
+mix_archives_source_path="\${HOME}/.kx/mix/archives"
+kx_url="https://raw.githubusercontent.com/halostatue/kx/main/kx"
+cached_release_list="${base_path}/.cached_release_list"
+cached_branch_list="${base_path}/.cached_branch_list"
+verbose=false
+quiet=false
+force=false
+update=false
+
+user_agent="kx-elixir-installer ${kx_version}"
+
+auth_header=()
+[[ -n "${KX_OAUTH_TOKEN}" ]] &&
+  auth_header=(-H "Authorization: Token ${KX_OAUTH_TOKEN}")
+
+# Running bash -l from csh does not change $SHELL
+usershell="${USERSHELL:-$(basename "${SHELL}")}"
+
+function info() {
+  if "${verbose}" || ! "${quiet}"; then
+    printf "%b\n" "${*}"
+  fi
+}
+
+function error() {
+  printf >&2 "%b\n" "${*}"
+}
+
+function halt() {
+  local -i status
+  status="${1:-${?}}"
+  shift
+
+  ((${#})) && error "${@}"
+  exit "${status}"
+}
+
+function discover_system() {
+  system="$(UNAME -s)"
+  case "${system}" in
+  Linux)
+    if which lsb_release 1>/dev/null 2>&1; then
+      distro="$(lsb_release -s -i)"
+    elif grep -qi arch /etc/os-release; then
+      distro=Arch
+    elif grep -qi fedora /etc/os-release; then
+      distro=Fedora
+    elif grep -qi ubuntu /etc/issue; then
+      distro=Ubuntu
+    elif grep -qi cenos /etc/issue; then
+      distro=Centos
+    elif [[ -f /etc/gentoo-release ]]; then
+      distro=Gentoo
+    else
+      echo "Unknown Linux distribution"
+      distro=Linux
+    fi
+    ;;
+  FreeBSD)
+    distro="${system}"
+    ;;
+  Darwin)
+    distro=macOS
+    ;;
+  *)
+    if force; then
+      info "Unsupported system ${system}. Continuing."
+    else
+      halt 1 "Unsupported system ${system}. Stopping."
+    fi
+    ;;
+  esac
+}
+
+function curl_github_api() {
+  curl_github -q -H "Accept: application/json" \
+    "https://api.github.com/repos/${1}/${2}${3:+?$3}"
+}
+
+function curl_github() {
+  if ! command curl -sSL "${auth_header[@]}" -H "User-Agent: ${user_agent}" "${@}"; then
+    halt "${?}" "Error calling Github for '${*}': ${?}."
+  fi
+}
+
+function download_kx() {
+  mkdir -p "${bin_path}"
+  curl_github -o "${kx_path}" "${kx_url}"
+  chmod +x "${kx_path}"
+}
+
+function do_install_kx() {
+  if [[ -x "${kx_path}" ]]; then
+    exec "${kx_path}" selfupdate
+  else
+    download_kx
+
+    info Running initial environment setup
+    exec "${kx_path}" setup
+  fi
+}
+
+function usage() {
+  local verbose
+  verbose=true
+  info "${bn0}: Install and Manage Elixir Versions (${kx_version})\n"
+  info "Usage: ${bn0} [OPTIONS] COMMAND...\n"
+  info "Commands:"
+  info "\tlist                      shows currently installed Elixir versions"
+  info "\tlist known                shows available Elixir releases"
+  info "\tlist branches             shows available Elixir branches"
+  info "\tinstall VERSION [AS]      installs the given release version"
+  info "\tuninstall VERSION         uninstalls the given release version"
+  info "\talias VERSION ALIAS       creates an alias for the given version"
+  info "\tunalias ALIAS             removes an alias"
+  info "\tuse VERSION [--default]   uses the given version for this shell"
+  info "\tshell VERSION             uses the given version for this shell"
+  info "\tdefault VERSION           sets the default version to be used"
+  info "\tselfupdate                updates kx itself"
+  info "\timplode                   removes kx and all installed Elixirs"
+  info "\treset                     resets default Elixir version to null"
+}
+
+# NOTE: work-around for differences in readlink on BSD and Linux
+# Based on the Stack Overflow answer http://stackoverflow.com/a/1116890
+function readlink_f() {
+  local target_file
+  target_file="$1"
+
+  cd "$(dirname "${target_file}")" ||
+    halt 1 "Error reading link to ${target_file}."
+
+  target_file="$(basename "${target_file}")"
+
+  # Iterate down a (possible) chain of symlinks
+  while [[ -L "${target_file}" ]]; do
+    target_file=$(readlink "${target_file}")
+    cd $(dirname "${target_file}") ||
+      halt 1 "Error reading link to ${target_file}."
+    target_file=$(basename "${target_file}")
+  done
+
+  # Compute the canonicalized name by finding the physical path for the
+  # directory we're in and appending the target file.
+  echo "$(pwd -P)/${target_file}"
+}
+
+function get_erlang_release_file() {
+  local exec_path
+
+  if [[ "${system}" = Linux ]]; then
+    exec_path="$(dirname "$(readlink -f "$(which erl 2>/dev/null)")")"
+    if [ -e "${exec_path}"/../releases/RELEASES ]; then
+      echo "${exec_path}"/../releases/RELEASES
+    else
+      echo "${exec_path}"/../../releases/RELEASES
+    fi
+  else
+    exec_path="$(dirname "$(readlink_f "$(which erl 2>/dev/null)")")"
+    echo "${exec_path}"/../releases/RELEASES
+  fi
+}
+
+function check_erlang_release() {
+  local erlang_release_file c
+  local -i r cn
+  local -a erlang_release
+  erlang_release_file="$(get_erlang_release_file)"
+
+  [[ -e "${erlang_release_file}" ]] ||
+    halt 1 "Failed to find the Erlang release file!"
+
+  erlang_release=(
+    "$(awk -F, '/Erlang\/OTP/ { gsub(/"/, "", $3); print $3; }' \
+      "${erlang_release_file}" | sed -E 's/R?([0-9]*)([A-Z])/\1 \2 /')"
+  )
+
+  r="${erlang_release[0]}"
+  c="${erlang_release[1]}"
+  cn="${erlang_release[2]}"
+
+  if [[ -z "$r" ]]; then
+    error "Failed to extract the Erlang release!"
+    return 1
+  elif [[ -n "${erlang_max_release}" ]] && ((r > erlang_max_release)); then
+    false
+  elif ((r > erlang_min_release)); then
+    true
+  elif ((r < erlang_min_release)); then
+    false
+  elif ((r == erlang_min_release)); then
+    if [[ -z "${erlang_min_release_candidate}" ]]; then
+      true
+    elif [[ -z "${c}" ]]; then
+      false
+    elif [[ "${erlang_min_release_candidate}" == "A" ]] && [ "${c}" == "B" ]; then
+      true
+    elif [[ "${erlang_min_release_candidate}" == "${c}" ]]; then
+      if [ -n "${erlang_min_release_candidate_n}" ]; then
+        if [ -z "${cn}" ]; then
+          false
+        elif ((cn < erlang_min_release_candidate_n)); then
+          false
+        else
+          true
+        fi
+      else
+        true
+      fi
+    else
+      # unknown character after release...
+      false
+    fi
+  fi
+}
+
+function bin_found() {
+  if [ -z "${1}" ]; then
+    false
+  elif [ -z "$(which ${1} 2>/dev/null)" ]; then
+    error "ERROR: ${1} not found in \$PATH"
+    false
+  else
+    true
+  fi
+}
+
+function exit_on_unmet_prereqs() {
+  deps_check && halt 1
+}
+
+function erlang_req_info() {
+  local verbose
+  verbose=true
+
+  if [ -n "${erlang_max_release}" ]; then
+    info \
+      The selected version of Elixir requires requires Erlang \
+      "${erlang_min_release_full}" or later but before \
+      "${erlang_before_release_full}."
+  else
+    info \
+      That Elixir requires Erlang "${erlang_min_release_full}" or later.
+  fi
+
+  info Erlang installation choices:
+  info "\t* Download - https://www.erlang-solutions.com/downloads/download-erlang-otp"
+  info "\t             http://www.erlang.org/download.html"
+  info "\t* Kerl - https://github.com/kerl/kerl"
+  info "\t* Package manager -"
+  info "\t         Arch: See AUR package,"
+  info "\t         FreeBSD: pkg install erlang"
+  info "\t         OS X: brew install erlang"
+  info "\t         Ubuntu/Debian/CentOS see erlang-solutions.com"
+}
+
+function deps_check() {
+  local -i errors
+  errors=0
+
+  if bin_found erl && check_erlang_release; then
+    :
+  else
+    erlang_req_info
+    errors=$((errors + 1))
+  fi
+
+  if ! bin_found git; then
+    error "\tInstall git and try again."
+    errors=$((errors + 1))
+  fi
+
+  if [[ "${system}" = FreeBSD ]] && ! bin_found gmake; then
+    error "\tInstall gmake and try again."
+    errors=$((errors + 1))
+  fi
+
+  ((errors == 0))
+}
+
+function backup_script() {
+  if [[ -f "${1}" ]] && [[ -n "${backup}" ]]; then
+    cp "${1}" "${1}-${backup}"
+  fi
+}
+
+function create_kx_env_script_bash() {
+  backup "${scripts_path}/kx.bash"
+
+  cat >"${scripts_path}/kx.bash" <<"EOF"
+KX_HOME="${KX_HOME:-${HOME}/.kx}"
+export PATH="${KX_HOME}/bin:${PATH}"
+[[ -f "${KX_HOME}"/elixirs/.default ]] && source "${KX_HOME}"/elixirs/.default
+
+function kx() {
+  if [[ "$1" = "use" ]]; then
+    source_line="$(USERSHELL=notcsh "${HOME}"/.kx/bin/kx "$[@]" | grep source)"
+    if [[ -z "${source_line}" ]]; then
+      echo "Failed to ${*}" >&2
+      return 1
+    else
+      eval "${source_line}"
+      shift
+      echo "Using ${*}"
+    fi
+  else
+    "${KX_HOME}/bin/kx" "${@}"
+  fi
+}
+EOF
+}
+
+function create_kx_env_script_csh() {
+  backup "${scripts_path}/kx.csh"
+
+  cat >"${scripts_path}/kx.csh" <<"EOF"
+if ( ! $?KX_HOME ) then
+  setenv KX_HOME="$HOME/.kx"
+endif
+setenv PATH "$KX_HOME/bin:$PATH"
+
+if ( -f $KX_HOME/elixirs/.default.csh ) then
+  source $KX_HOME/elixirs/.default.csh
+endif
+EOF
+}
+
+function create_kx_env_script_fish() {
+  backup "${scripts_path}/kx.fish"
+
+  cat >"$scripts_path/kx.fish" <<"EOF"
+set -q KX_HOME; or set KX_HOME $HOME/.kx
+set -gx PATH $KX_HOME/bin $PATH
+
+if test -f $KX_HOME/elixirs/.default.fish
+  source $KX_HOME/elixirs/.default.fish
+end
+
+function kx
+    if set -q argv[1]; and test $argv[1] = use
+        set -lx USERSHELL $SHELL
+        set -l source_line (command kx $argv | string match -e source)
+
+        if test -z "${source_line}"
+            echo "Failed to $argv" >&2
+            return 1
+        else
+            eval $source_line
+            set -e argv[1]
+            echo "Using $argv"
+        end
+    else
+        command kx $argv
+    end
+end
+EOF
+}
+
+function create_kx_env_script() {
+  local backup
+  backup="$(date +%Y%m%d.%H%M)"
+
+  create_kx_env_bash
+  create_kx_env_csh
+  create_kx_env_fish
+}
+
+function setup() {
+  local quiet update arg in_bashrc in_profile in_bash_profile in_zshrc \
+    in_zsh_profile in_fish_config str found version
+  local -a elixirs
+
+  for arg in "${@}"; do
+    case "${arg}" in
+    quiet) quiet=true ;;
+    update)
+      info "Updating the kx installation in ${KX_HOME}."
+      update=true
+      ;;
+    *) : ;;
+    esac
+
+  done
+
+  grep -sv '^#' "${HOME}"/.bashrc | grep -isq kx &&
+    in_bashrc="${HOME}"/.bashrc
+  grep -sv '^#' "${HOME}"/.profile | grep -isq kx &&
+    in_profile="${HOME}"/.profile
+  grep -sv '^#' "${HOME}"/.bash_profile | grep -isq kx &&
+    in_bash_profile="${HOME}"/.bash_profile
+  grep -sv '^#' "${HOME}"/.zshrc | grep -isq kx && in_zshrc="${HOME}"/.zshrc
+  grep -sv '^#' "${HOME}"/.zsh_profile | grep -isq kx &&
+    in_zsh_profile="${HOME}"/.zsh_profile
+  grep -sv '^#' "${XDG_CONFIG_HOME:-${HOME}/.config}/fish/config.fish" |
+    grep -isq kx && in_fish_config="${XDG_CONFIG_HOME:-${HOME}/.config}/fish/config.fish"
+
+  str=""
+  for s in $in_bashrc $in_profile $in_bash_profile $in_zshrc $in_zsh_profile \
+    $in_fish_config; do
+    if [[ -z "${str}" ]]; then
+      str="${s}"
+    else
+      str="${str}, $s"
+    fi
+  done
+
+  if [ -z "${str}" ]; then
+    info "\tKx sourcing line not found in any of:"
+    info "\t- ~/.bashrc"
+    info "\t- ~/.bash_profile"
+    info "\t- ~/.profile"
+    info "\t- ~/.zshrc"
+    info "\t- ~/.zsh_profile"
+    info "\t- ${XDG_CONFIG_HOME:-~/.config}/fish/config.fish"
+    found=false
+  else
+    info "\tKx sourcing line found in: ${str}"
+    found=true
+  fi
+
+  mkdir -p "${KX_HOME}"/{bin,builds,elixirs,scripts,mix/archives}
+
+  create_kx_env_script
+
+  find "${elixirs_path}" -maxdepth 1 -mindepth 1 -type d \
+    -exec basename {} \; | sort | read -a elixirs
+
+  for version in "${elixirs[@]}"; do
+    [[ -x "${elixirs_path}/${version}/bin/elixir" ]] || continue
+    mkdir -p "${mix_archives_path}/${version}"
+    create_env_file "${version/elixir-/}"
+  done
+
+  if ! "${found}"; then
+    info "\tAdd the following to your shell's config file (.bashrc/.zshrc/.cshrc):"
+    info "\ttest -s \"\$HOME/.kx/scripts/kx\" && source \"\$HOME/.kx/scripts/kx\""
+  fi
+
+  if "${update}"; then
+    info "kx installed in ${KX_HOME} is now updated ☺."
+  else
+    info "kx has been installed in ${KX_HOME} ☺."
+  fi
+}
+
+function self_update_reloaded() {
+  cd "${bin_path}" || halt 1 "Cannot change to ${bin_path}"
+  setup quiet update
+}
+
+function self_update() {
+  cd "${bin_path}" || halt 1 "Cannot change to ${bin_path}"
+
+  local backup
+  backup="$(date +%Y%m%d.%H%M)"
+
+  backup kx
+  download_kx
+  exec "${kx_path}" selfupdatereloaded
+}
+
+function kx_implode() {
+  local resp verbose
+  verbose=true
+
+  printf "Type YES to remove the kx install and all Elixir versions: "
+  read resp
+
+  if [[ "${resp}" != "YES" ]]; then
+    info "Aborting kx implode."
+    exit 0
+  fi
+
+  [[ -d "${KX_HOME}" ]] && rm -rf "$KX_HOME"
+
+  info "You can now remove the kx source lines from your startup script. It looks like:"
+  info "\ttest -s \"\$HOME/.kx/scripts/kx\" && source \"\$HOME/.kx/scripts/kx\""
+  info "or"
+  info "\t[[ -s \"\$HOME/.kx/scripts/kx\" ]] && source \"\$HOME/.kx/scripts/kx\""
+}
+
+function get_elixir_branches() {
+  curl_github_api "${KX_REPO}" branches | grep '"name":' |
+    tr ',' '\n' | grep name\": | sed 's/.*name":"\([^"]*\)"/\1/' | sed 's/^/    /'
+}
+
+function list_branches() {
+  info "Getting the available branches from https://github.com/${KX_REPO}/branches\n"
+  elixir_branches=$(get_elixir_branches)
+
+  info "Current Elixir branches:"
+  printf "%b" "${elixir_branches}\n"
+}
+
+# function get_cached_elixir_releases() {
+#   tail -n +2 $cached_release_list
+# }
+#
+# function get_cached_releases_etag() {
+#   xetag=$(grep "^#Etag:" $cached_release_list)
+#   echo ${xetag//#Etag:}
+# }
+#
+# function update_release_cache() {
+#   x="$*"
+#   xetag=$(echo $x|grep ETag)
+#   xetag=${xetag//ETag: /}
+#   xetag=${xetag//"/}
+#   new_etag=${xetag//ETag: /}
+#   cached_etag=$(get_cached_releases_etag)
+#   echo "$x"
+# }
+
+function get_known_elixir_releases() {
+  # TODO: finish adding caching support with etags
+  # xetag=$(curl -i -H "User-Agent: ${user_agent}" -qs https://api.github.com/repos/elixir-lang/elixir/releases |grep "^ETag")
+  # etag=${xetag//Etag: "/}
+  #
+  #   x=$(curl -i -H "User-Agent: ${user_agent}" -H "Accept: application/json" -qs https://api.github.com/repos/elixir-lang/elixir/releases |grep '"tag_name":|ETag')
+  #   xetag=$(echo $x|grep ETag)
+  #   x=$(echo $x|grep -v ETag)
+
+  x=$(\curl -i ${auth_header[*]} -H "User-Agent: ${user_agent}" -H 'Accept: application/json' -qs "https://api.github.com/repos/elixir-lang/elixir/releases?per_page=100" | tr ',' '\n' | grep '"tag_name":')
+  x=${x//\"tag_name\":/}
+  x=${x//[\",]/}
+  x=${x//v/}
+
+  # update_release_cache "$x"
+  echo "$x" | sed 's/^/    /' | sort -t. -k 1,1n -k 2,2n -k 3,3n -k 4,4n
+}
+
+function get_latest_elixir_release() {
+  x=$(curl -i ${auth_header[*]} -H "User-Agent: ${user_agent}" -H 'Accept: application/json' -qs https://api.github.com/repos/elixir-lang/elixir/releases/latest | tr ',' '\n' | grep '"tag_name":' | sed -E 's/"tag_name":"v(.+)"$/\1/')
+
+  echo "$x"
+}
+
+function list_known() {
+  echo "Getting the available releases from https://github.com/elixir-lang/elixir/releases"
+  echo
+  elixir_releases=$(get_known_elixir_releases)
+  #elixir_releases=$x
+
+  echo "Known Elixir releases: "
+  printf "%b" "${elixir_releases}\n"
+}
+
+function get_latest() {
+  echo "Getting the latest release from https://github.com/elixir-lang/elixir/releases/latest"
+  # add empty line
+  echo
+  local latest_release=$(get_latest_elixir_release)
+  echo "Latest release is ${latest_release}"
+  # add empty line
+  echo
+  read -p "Do you want to install it? [y/n]" -n 1 -r
+
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    install_elixir $latest_release
+  fi
+}
+
+function valid_known_release() {
+  ver="$1"
+  get_known_elixir_releases | grep -q "$1$" 2>/dev/null
+  echo $?
+}
+
+function valid_branch() {
+  ver="$1"
+  get_elixir_branches | grep -q "$1" 2>/dev/null
+  echo $?
+}
+
+function exit_on_invalid_version() {
+  version="$1"
+
+  if [ ! "$(valid_known_release ${version})" = 0 -a ! "$(valid_branch ${version})" = 0 ]; then
+    echo "Unknown Elixir '$version' ☹ "
+    echo -e "Try\n\tkx list known -- known releases\n\tkx list branches -- current branches"
+    exit 1
+  fi
+}
+
+function install_elixir() {
+  ver="$1"
+  ver=${ver//v/}
+  major=${ver%%.[0-9]*}
+  mp=${ver#[0-9]*.}
+  minor=${mp%.*[0-9]}
+  patch=${ver##*[0-9].}
+  if (($major >= 1)) || (($minor > 12)) || (($ver == "master")); then
+    need_erl_17=1
+  fi
+
+  if [ "$need_erl_17" = 1 ]; then
+    erlang_min_release_full="R17"
+    erlang_min_release=17
+    erlang_min_release_candidate=""
+    erlang_min_release_candidate_n=""
+  else
+    erlang_min_release_full="R16B"
+    erlang_min_release=16
+    erlang_before_release_full=R17
+    erlang_max_release=16
+    erlang_min_release_candidate="B"
+    erlang_min_release_candidate_n=""
+  fi
+
+  version="$1"
+
+  exit_on_invalid_version "$1"
+  exit_on_unmet_prereqs
+
+  install_path="${elixirs_path}/elixir-${version}"
+
+  cd "$build_path"
+  echo "Downloading elixir version ${version}"
+  git clone https://github.com/elixir-lang/elixir.git elixir-git 2>/dev/null
+  cd elixir-git
+  echo "Installing elixir version ${version}"
+  git checkout -f master
+  git fetch -t
+  # TODO: deal with conflicts between branches and tags
+  git branch -la | grep -q "origin/${version}"
+  if [ "$?" = 0 ]; then
+    git checkout -b "${version}" -f "origin/${version}" || git checkout "${version}"
+    git pull origin "${version}"
+  else
+    git checkout -b "v${version}" -f "v${version}" || git checkout "v${version}"
+    git pull origin "v${version}"
+  fi
+
+  if [ "${system}" = "FreeBSD" ]; then
+    MAKE=gmake
+  else
+    MAKE=make
+  fi
+  $MAKE clean compile
+  mkdir -p "$install_path"
+  # elixir make install does not work under *csh
+  $MAKE "PREFIX=$install_path" install
+
+  if [ ! "$?" = 0 ]; then
+    echo "Problem with Elixir build.  Aborting!"
+    echo "Please report via https://github.com/taylor/kx/issues/new"
+    exit 1
+  fi
+
+  # For MIX_ARCHIVES - http://elixir-lang.org/docs/master/mix/Mix.Tasks.Archive.html
+  mkdir -p "${mix_archives_path}/elixir-${version}"
+
+  echo "Installed Elixir version $version"
+  create_env_file "$version"
+
+  echo "Load with:"
+  echo "           kx use ${version} "
+  echo "or load the elixir environment file with: "
+  printf "%b" "   "
+
+  case $(basename $SHELL) in
+  fish)
+    printf "%b" "source ${elixirs_source_path}/.elixir-${version}.env.fish\n"
+    ;;
+  csh | tcsh)
+    printf "%b" "source ${elixirs_source_path}/.elixir-${version}.env.csh\n"
+    ;;
+  *)
+    printf "%b" "source ${elixirs_source_path}/elixir-${version}.env\n"
+    ;;
+  esac
+}
+
+function uninstall_elixir() {
+  typeset version delete_version current_elixir default_elixir iexpath x1
+  typeset alias_file alias_name target_file target_name target_alias_list a
+
+  version="$1"
+  delete_version=$(find_elixir_ver "$version")
+
+  if [[ -z "$delete_version" ]]; then
+    echo "Elixir version '$version' not found."
+    exit 1
+  fi
+
+  if [[ -e "$elixirs_path"/.default ]]; then
+    default_elixir="elixir-$(
+      source $elixirs_path/.default
+      echo $ELIXIR_VERSION
+    )"
+  fi
+
+  iexpath=$(which iex 2>/dev/null)
+  if [[ -n "${iexpath}" ]]; then
+    x1=${iexpath/$elixirs_path\//}
+    current_elixir=${x1/\/bin\/iex/}
+  fi
+
+  if [[ "$delete_version" == "$current_elixir" ]]; then
+    echo "'$version' is the current version of Elixir."
+    echo "Please set kx to use another version of Elixir and try again."
+    exit 1
+  fi
+
+  if [[ "$delete_version" == "$default_elixir" ]]; then
+    reset_elixir >/dev/null
+  fi
+
+  # remove aliases
+  pushd "$elixirs_path" >/dev/null
+  target_alias_list=""
+  for alias_file in $(find . -maxdepth 1 -mindepth 1 -type l -name ".elixir-*"); do
+    alias_name="${alias_file//.\/.elixir-/}"
+    target_file="$(readlink $alias_file)"
+    target_name="$(basename $target_file .env)"
+
+    target_alias_list_name="ealiases__${target_name//[^[:alnum:]]/}"
+    target_alias_list=${!target_alias_list_name}
+    if [[ -z "$target_alias_list" ]]; then
+      target_alias_list="$alias_name"
+    else
+      target_alias_list="$target_alias_list $alias_name"
+    fi
+    printf -v "ealiases__${target_name//[^[:alnum:]]/}" %s "$target_alias_list"
+  done
+  popd >/dev/null
+
+  target_alias_list_name="ealiases__${delete_version//[^[:alnum:]]/}"
+  target_alias_list=${!target_alias_list_name}
+  for a in $target_alias_list; do
+    remove_alias "$a"
+  done
+
+  # remove the actual files
+  rm -f "$KX_HOME/elixirs/.$delete_version.env."*sh*
+  rm -Rf "$KX_HOME/elixirs/$delete_version"
+  rm -f "$KX_HOME/elixirs/$delete_version.env"*
+  rm -Rf "$KX_HOME/mix/archives/$delete_version"
+}
+
+function create_env_file() {
+  new_ver="$1"
+  new_file="${elixirs_path}/elixir-${new_ver}.env"
+  new_path="${elixirs_path}/elixir-${new_ver}/bin"
+  new_mix_path="${elixirs_path}/elixir-${new_ver}/ebin"
+
+  if [ -f "$new_file" ]; then
+    mv -f "$new_file" "${new_file}.old"
+  fi
+  ## Bash and Zsh
+  cat <<EOF >$new_file
+export ELIXIR_VERSION="$new_ver"
+export PATH="${elixirs_source_path}/elixir-${new_ver}/bin:\$PATH"
+export MIX_ARCHIVES="${mix_archives_source_path}/elixir-${new_ver}"
+EOF
+
+  # TODO: add MIX_PATH maybe?
+  #export MIX_PATH="${elixirs_source_path}/dynamo-${new_ver}/ebin:\$MIX_PATH"
+  #export MIX_PATH="${elixirs_source_path}/elixir-${new_ver}/ebin:\$MIX_PATH"
+
+  ## CSH
+  new_file="${elixirs_path}/.elixir-${new_ver}.env.csh"
+  if [ -f "$new_file" ]; then
+    mv -f "$new_file" "${new_file}.old"
+  fi
+  cat <<EOF >$new_file
+setenv ELIXIR_VERSION "$new_ver"
+setenv PATH "${elixirs_source_path}/elixir-${new_ver}/bin:\$PATH"
+setenv MIX_ARCHIVES "${mix_archives_source_path}/elixir-${new_ver}"
+EOF
+
+  ## Fish
+  new_file="${elixirs_path}/.elixir-${new_ver}.env.fish"
+  if [ -f "$new_file" ]; then
+    mv -f "$new_file" "${new_file}.old"
+  fi
+  cat <<EOF >$new_file
+set -gx ELIXIR_VERSION $new_ver
+set -gx PATH ${elixirs_source_path}/elixir-${new_ver}/bin \$PATH
+set -gx MIX_ARCHIVES ${mix_archives_source_path}/elixir-${new_ver}
+EOF
+}
+
+function find_elixir_ver() {
+  target_elixir="$1"
+  # default to not found (1)
+  found=""
+
+  elixirs=($(
+    cd "$elixirs_path"
+    find . -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort
+  ))
+
+  #TODO: reset version to nothing if problems arise
+  for version in "${elixirs[@]//.\//}"; do
+    if [[ ! -x "$elixirs_path/$version/bin/elixir" ]]; then
+      continue
+    elif [[ ! -f "$elixirs_path/${version}.env" ]]; then
+      continue
+    elif [ ! "$version" = "$target_elixir" -a ! "${version}" = "elixir-${target_elixir}" ]; then
+      continue
+    else
+      found=yes
+      break
+    fi
+  done
+  if [ -n "$found" ]; then
+    echo $version
+  else
+    echo ""
+  fi
+}
+
+function use_elixir() {
+  target_elixir="$1"
+  version=$(find_elixir_ver "$target_elixir")
+
+  [[ -z $version ]] && version=$(get_version_from_alias "$target_elixir")
+
+  if [ -z "$version" ]; then
+    echo "Elixir version $target_elixir not found.  Try kx install $target_elixir"
+    exit 1
+  fi
+
+  echo "To switch elixir versions for your current shell run: "
+  printf "%b" "   "
+  if [ "$usershell" = "fish" ]; then
+    printf "%b" "source ${elixirs_source_path}/.${version}.env.fish\n"
+  elif [ "$usershell" = "csh" ]; then
+    printf "%b" "source ${elixirs_source_path}/.${version}.env.csh\n"
+  else
+    printf "%b" "source ${elixirs_source_path}/${version}.env\n"
+  fi
+}
+
+function get_version_from_alias() {
+  local alias="$1"
+  local version_installed=""
+  local symlink_path="${elixirs_path}/.elixir-$alias"
+
+  if [[ -L $symlink_path ]]; then
+    local origin_path=$(readlink "$symlink_path")
+    local origin_version=$(basename "$origin_path" | grep -oh "[0-9]*\.[0-9]*\.[0-9]*")
+    local version_installed=$(find_elixir_ver "$origin_version")
+  fi
+
+  echo "$version_installed"
+}
+
+function create_alias() {
+  local source_version="$1"
+  local alias_name="$2"
+  local version_installed=$(find_elixir_ver "$source_version")
+
+  if [[ ! -z $version_installed ]]; then
+    ln -fs ${elixirs_path}/$version_installed.env ${elixirs_path}/.elixir-$alias_name
+  else
+    echo "Elixir $source_version is not installed"
+  fi
+}
+
+function remove_alias() {
+  local alias_name="$1"
+  local symlink_path="${elixirs_path}/.elixir-$alias_name"
+
+  if [[ -L "$symlink_path" ]]; then
+    rm -f "$symlink_path"
+  else
+    echo "Alias '$alias_name' does not exist."
+  fi
+}
+
+function elixir_subshell() {
+  target_elixir="$1"
+  version=$(find_elixir_ver "$target_elixir")
+
+  if [ -z "$version" ]; then
+    echo "Elixir version $target_elixir not found.  Try installing it"
+    exit 1
+  fi
+
+  echo "Starting sub-shell with elixir version $version"
+  source "${elixirs_path}/${version}.env"
+  # NOTE: Using a login shell will use a default kx elixir...
+  exec $SHELL
+}
+
+function set_default_elixir() {
+  target_elixir="$1"
+  version=$(find_elixir_ver "$target_elixir")
+
+  if [ -z "$version" ]; then
+    echo "Elixir version $target_elixir not found.  Try installing it"
+    exit 1
+  fi
+
+  if [ -e ${elixirs_path}/.default ]; then
+    if [ -L ${elixirs_path}/.default ]; then
+      rm ${elixirs_path}/.default
+      rm ${elixirs_path}/.default.csh
+      rm ${elixirs_path}/.default.fish
+    else
+      echo "The file ${elixirs_path}/.default should not exists! Fix and try again."
+      exit 1
+    fi
+  fi
+  ln -s "${elixirs_path}/${version}.env" "${elixirs_path}/.default"
+  ln -s "${elixirs_path}/.${version}.env.csh" "${elixirs_path}/.default.csh"
+  ln -s "${elixirs_path}/.${version}.env.fish" "${elixirs_path}/.default.fish"
+  echo "Default Elixir version set to $version"
+  #echo "Load right now with: kx use $version"
+}
+
+function reset_elixir() {
+  if [ -e ${elixirs_path}/.default ]; then
+    if [ -L ${elixirs_path}/.default ]; then
+      rm ${elixirs_path}/.default
+      rm ${elixirs_path}/.default.csh
+      rm ${elixirs_path}/.default.fish
+    else
+      echo "The file ${elixirs_path}/.default should not exists! Fix and try again."
+      exit 1
+    fi
+  fi
+  echo "Reset default Elixir version."
+}
+
+function list_elixirs() {
+  typeset current_elixir elixirs version selected system_elixir system_version \
+    default_elixir string binary
+  typeset alias_file alias_name target_file target_name target_alias_list
+
+  if [ -e "$elixirs_path"/.default ]; then
+    default_elixir="elixir-$(
+      source $elixirs_path/.default
+      echo $ELIXIR_VERSION
+    )"
+  fi
+
+  iexpath=$(which iex 2>/dev/null)
+  if [ -n "${iexpath}" ]; then
+    #v=$(iex --version 2> /dev/null|grep -v 'Warning: could not run')
+    x1=${iexpath/$elixirs_path\//}
+    current_elixir=${x1/\/bin\/iex/}
+    #current_elixir="elixir-${v/Elixir /}"
+  fi
+
+  elixirs=($(
+    cd "$elixirs_path"
+    find . -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort
+    #find . -maxdepth 1 -mindepth 1 -type d | sed -e 's#./##g'
+  ))
+
+  pushd "$elixirs_path" >/dev/null
+  target_alias_list=""
+  for alias_file in $(find . -maxdepth 1 -mindepth 1 -type l -name ".elixir-*"); do
+    alias_name="${alias_file//.\/.elixir-/}"
+    target_file="$(readlink $alias_file)"
+    target_name="$(basename $target_file .env)"
+
+    target_alias_list_name="ealiases__${target_name//[^[:alnum:]]/}"
+    target_alias_list=${!target_alias_list_name}
+    if [[ -z "$target_alias_list" ]]; then
+      target_alias_list="$alias_name"
+    else
+      target_alias_list="$target_alias_list $alias_name"
+    fi
+    printf -v "ealiases__${target_name//[^[:alnum:]]/}" %s "$target_alias_list"
+  done
+  popd >/dev/null
+
+  #for version in "${elixirs//.\/}"
+  for version in "${elixirs[@]//.\//}"; do
+    if [[ ! -x "$elixirs_path/$version/bin/elixir" ]]; then
+      continue
+    fi
+
+    if [[ "$version" = "$current_elixir" && "$version" = "$default_elixir" ]]; then
+      printf "%b" "=* "
+    elif [[ "$version" = "$current_elixir" ]]; then
+      printf "%b" "=> "
+    elif [[ "$version" = "$default_elixir" ]]; then
+      printf "%b" " * "
+    else
+      printf "%b" "   "
+    fi
+
+    printf "%b" "$version"
+    target_alias_list_name="ealiases__${version//[^[:alnum:]]/}"
+    target_alias_list=${!target_alias_list_name}
+    [[ -n "$target_alias_list" ]] && printf " [%b]" "$target_alias_list"
+    printf "%b" "\n"
+  done
+
+  if ((${#elixirs[@]} == 0)); then
+    printf "%b" "
+# No kx elixirs installed yet. Try 'kx install <version>'.
+"
+  else
+    if [[ -z "${default_elixir}" ]]; then
+      printf "%b" "
+# Default elixir not set. Try 'kx default <version>'.
+"
+    fi
+    printf "%b" "
+# => - current
+# =* - current && default
+#  * - default
+"
+  fi
+
+  printf "%b" "\n"
+}
+
+function validate_install() {
+  if [ ! -d "${base_path}/builds" \
+    -o ! -d "${base_path}/elixirs" \
+    -o ! -d "${base_path}/scripts" \
+    -o ! -d "${base_path}/bin" \
+    ]; then
+
+    echo "Please run ${bn0} setup"
+    exit 1
+    #setup
+  fi
+}
+
+#################################
+#################################
+
+install_kx=false
+if [ "$1" = "install_kx" ]; then
+  install_kx=true
+elif [ "$1" = "install" ] && [ "$2" = "kx" ]; then
+  install_kx=true
+fi
+
+"${install_kx}" && do_install_kx
+
+action="$1"
+shift
+
+if [ -z "$action" ]; then
+  usage
+  exit 0
+fi
+
+if [ ! "$action" = "setup" ]; then
+  validate_install
+elif [ ! "$action" = "install" -a "$1" = "kx" ]; then
+  validate_install
+fi
+
+case $action in
+list)
+  if [ -z "$1" ]; then
+    printf "%b" "\nkx elixirs\n\n"
+    list_elixirs
+  elif [ "$1" = "known" -o "$1" = "releases" ]; then
+    list_known
+  elif [ "$1" = "branches" ]; then
+    list_branches
+  else
+    usage
+    exit 1
+  fi
+  ;;
+install)
+  [[ -z "$1" ]] && usage && exit 1
+  if [ "$1" = "kx" ]; then
+    setup
+    echo "kx has been installed in $KX_HOME"
+    echo "Add the following to your shell's config file (.bash_profile/.profile):"
+    echo "    [[ -s \"\$HOME/.kx/scripts/kx\" ]] && source \"\$HOME/.kx/scripts/kx\""
+    exit
+  fi
+  if [ "$1" = "latest" ]; then
+    get_latest
+    exit
+  fi
+  install_elixir "$1"
+  ;;
+uninstall)
+  [[ -z "$1" ]] && usage && exit 1
+  uninstall_elixir "$1"
+  ;;
+use)
+  [[ -z "$1" ]] && usage && exit 1
+  if [ "$2" = "--default" -o "$2" = "-default" ]; then
+    set_default_elixir "$1"
+  fi
+  use_elixir "$1"
+  ;;
+default)
+  [[ -z "$1" ]] && usage && exit 1
+  set_default_elixir "$1"
+  ;;
+reset)
+  reset_elixir
+  ;;
+shell)
+  [[ -z "$1" ]] && usage && exit 1
+  elixir_subshell "$1"
+  ;;
+envfile)
+  [[ -z "$1" ]] && exit 1
+  create_env_file "$1"
+  ;;
+selfupdate | update_self)
+  self_update
+  exit 0
+  ;;
+selfupdatereloaded)
+  self_update_reloaded
+  exit 0
+  ;;
+implode)
+  kx_implode
+  exit 0
+  ;;
+depscheck | checkdeps)
+  deps_check
+  [[ $? = 0 ]] && echo "Dependencies met" || (echo "Dependencies not met" && exit_on_unmet_prereqs)
+  ;;
+setup | reinstall)
+  setup
+  exit
+  ;;
+alias)
+  [[ -z "$1" ]] || [[ -z "$2" ]] && usage && exit 1
+  create_alias "$1" "$2"
+  exit
+  ;;
+unalias)
+  [[ -z "$1" ]] && usage && exit 1
+  remove_alias "$1"
+  exit
+  ;;
+*)
+  usage
+  exit
+  ;;
+esac
