@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# vim: ft=bash tw=80
 
-# If KX_HOME is already set, use that value.
-KX_HOME="${KX_HOME:-${HOME}/.kx}"
-export KX_HOME
+set -euo pipefail
 
-declare bn0 base_path bin_path kx_path build_path scripts_path elixirs_path \
-  elixirs_source_path mix_archives_path mix_archives_source_path kx_url \
-  cached_release_list cached_branch_list user_agent system usershell distro \
-  quiet verbose force install_kx kx_version update KX_REPO
-declare -a auth_header
+declare KX_HOME KX_OAUTH_TOKEN kx_version user_agent bn0 kx_url
 
-KX_REPO=${KX_REPO:-elixir-lang/elixir}
-kx_version="2.0.0"
+KX_HOME="$(
+  cd "$(dirname "${KX_HOME:-${HOME}/.kx}}")" || exit 1
+  pwd -P
+)/.kx"
+kx_version="1.0.0"
+user_agent="kx-elixir-installer ${kx_version}"
 bn0="$(basename "${0}")"
+kx_url="https://raw.githubusercontent.com/halostatue/kx/main/kx"
+
+readonly kx_version KX_HOME user_agent bn0 kx_url
+
+declare base_path bin_path kx_path build_path scripts_path elixirs_path \
+  elixirs_source_path mix_archives_path mix_archives_source_path usershell \
+  system default_repo
+
 base_path="${KX_HOME}"
 bin_path="${base_path}/bin"
 kx_path="${bin_path}/kx"
@@ -21,23 +26,34 @@ build_path="${base_path}/builds"
 scripts_path="${base_path}/scripts"
 elixirs_path="${base_path}/elixirs"
 mix_archives_path="${base_path}/mix/archives"
-mix_archives_source_path="\${HOME}/.kx/mix/archives"
-kx_url="https://raw.githubusercontent.com/halostatue/kx/main/kx"
-cached_release_list="${base_path}/.cached_release_list"
-cached_branch_list="${base_path}/.cached_branch_list"
+elixirs_source_path="${KX_HOME/${HOME}/\$HOME}/elixirs"
+mix_archives_source_path="${KX_HOME/${HOME}/\$HOME}/mix/archives"
+default_repo=elixir-lang/elixir
+
+# Running bash -l from csh does not change $SHELL
+usershell="${USERSHELL:-$(basename "${SHELL}")}"
+system="$(uname -s | tr '[:upper]' '[:lower:]')"
+
+readonly base_path bin_path kx_path build_path scripts_path elixirs_path \
+  elixirs_source_path mix_archives_path mix_archives_source_path usershell \
+  system default_repo
+
+declare -a headers api_headers
+headers=(-H "User-Agent: ${user_agent}")
+
+[[ -n "${KX_OAUTH_TOKEN}" ]] &&
+  headers=("${headers[@]}" -H "Authorization: Token ${KX_OAUTH_TOKEN}")
+
+api_headers=(-H "Accept: application/vnd.github.v3+json" "${headers[@]}")
+
+readonly headers api_headers
+
+declare quiet verbose force update usershell install_kx elixir_repo
+
 verbose=false
 quiet=false
 force=false
 update=false
-
-user_agent="kx-elixir-installer ${kx_version}"
-
-auth_header=()
-[[ -n "${KX_OAUTH_TOKEN}" ]] &&
-  auth_header=(-H "Authorization: Token ${KX_OAUTH_TOKEN}")
-
-# Running bash -l from csh does not change $SHELL
-usershell="${USERSHELL:-$(basename "${SHELL}")}"
 
 function info() {
   if "${verbose}" || ! "${quiet}"; then
@@ -58,33 +74,9 @@ function halt() {
   exit "${status}"
 }
 
-function discover_system() {
-  system="$(UNAME -s)"
+function verify_system() {
   case "${system}" in
-  Linux)
-    if which lsb_release 1>/dev/null 2>&1; then
-      distro="$(lsb_release -s -i)"
-    elif grep -qi arch /etc/os-release; then
-      distro=Arch
-    elif grep -qi fedora /etc/os-release; then
-      distro=Fedora
-    elif grep -qi ubuntu /etc/issue; then
-      distro=Ubuntu
-    elif grep -qi cenos /etc/issue; then
-      distro=Centos
-    elif [[ -f /etc/gentoo-release ]]; then
-      distro=Gentoo
-    else
-      echo "Unknown Linux distribution"
-      distro=Linux
-    fi
-    ;;
-  FreeBSD)
-    distro="${system}"
-    ;;
-  Darwin)
-    distro=macOS
-    ;;
+  linux | freebsd | darwin) : ;;
   *)
     if force; then
       info "Unsupported system ${system}. Continuing."
@@ -96,19 +88,28 @@ function discover_system() {
 }
 
 function curl_github_api() {
-  curl_github -q -H "Accept: application/json" \
-    "https://api.github.com/repos/${1}/${2}${3:+?$3}"
-}
+  local action params
+  action="${1}"
+  shift
 
-function curl_github() {
-  if ! command curl -sSL "${auth_header[@]}" -H "User-Agent: ${user_agent}" "${@}"; then
+  while ((${#})); do
+    if [[ -z "${params}" ]]; then
+      params="?${1}"
+    else
+      params="&${1}"
+    fi
+    shift
+  done
+
+  command curl -qsSL "${api_headers[@]}" \
+    "https://api.github.com/repos/${elixir_repo}/${action}${params}" ||
     halt "${?}" "Error calling Github for '${*}': ${?}."
-  fi
 }
 
 function download_kx() {
   mkdir -p "${bin_path}"
-  curl_github -o "${kx_path}" "${kx_url}"
+  command curl -sSL "${headers[@]}" -o "${kx_path}" "${kx_url}" ||
+    halt "${?}" "Error calling Github for '${*}': ${?}."
   chmod +x "${kx_path}"
 }
 
@@ -158,7 +159,7 @@ function readlink_f() {
   # Iterate down a (possible) chain of symlinks
   while [[ -L "${target_file}" ]]; do
     target_file=$(readlink "${target_file}")
-    cd $(dirname "${target_file}") ||
+    cd "$(dirname "${target_file}")" ||
       halt 1 "Error reading link to ${target_file}."
     target_file=$(basename "${target_file}")
   done
@@ -171,7 +172,7 @@ function readlink_f() {
 function get_erlang_release_file() {
   local exec_path
 
-  if [[ "${system}" = Linux ]]; then
+  if [[ "${system}" = linux ]]; then
     exec_path="$(dirname "$(readlink -f "$(which erl 2>/dev/null)")")"
     if [ -e "${exec_path}"/../releases/RELEASES ]; then
       echo "${exec_path}"/../releases/RELEASES
@@ -184,63 +185,59 @@ function get_erlang_release_file() {
   fi
 }
 
-function check_erlang_release() {
-  local erlang_release_file c
-  local -i r cn
-  local -a erlang_release
-  erlang_release_file="$(get_erlang_release_file)"
+function erlv() {
+  erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell
+}
 
-  [[ -e "${erlang_release_file}" ]] ||
-    halt 1 "Failed to find the Erlang release file!"
-
-  erlang_release=(
-    "$(awk -F, '/Erlang\/OTP/ { gsub(/"/, "", $3); print $3; }' \
-      "${erlang_release_file}" | sed -E 's/R?([0-9]*)([A-Z])/\1 \2 /')"
+function erlv_full() {
+  local v e f
+  local -a ff
+  v="$(erlv)"
+  e="$(dirname "$(dirname "$(which erl 2>/dev/null)")")"
+  ff=(
+    "${e}/releases/${v}/OTP_VERSION"
+    "${e}/lib/erlang/releases/${v}/OTP_VERSION"
+    "${e}/releases/${v}/OTP_RELEASE"
+    "${e}/lib/erlang/releases/${v}/OTP_RELEASE"
   )
 
-  r="${erlang_release[0]}"
-  c="${erlang_release[1]}"
-  cn="${erlang_release[2]}"
-
-  if [[ -z "$r" ]]; then
-    error "Failed to extract the Erlang release!"
-    return 1
-  elif [[ -n "${erlang_max_release}" ]] && ((r > erlang_max_release)); then
-    false
-  elif ((r > erlang_min_release)); then
-    true
-  elif ((r < erlang_min_release)); then
-    false
-  elif ((r == erlang_min_release)); then
-    if [[ -z "${erlang_min_release_candidate}" ]]; then
-      true
-    elif [[ -z "${c}" ]]; then
-      false
-    elif [[ "${erlang_min_release_candidate}" == "A" ]] && [ "${c}" == "B" ]; then
-      true
-    elif [[ "${erlang_min_release_candidate}" == "${c}" ]]; then
-      if [ -n "${erlang_min_release_candidate_n}" ]; then
-        if [ -z "${cn}" ]; then
-          false
-        elif ((cn < erlang_min_release_candidate_n)); then
-          false
-        else
-          true
-        fi
-      else
-        true
-      fi
-    else
-      # unknown character after release...
-      false
+  for f in "${ff[@]}"; do
+    if [[ -f "${f}" ]]; then
+      cat "${f}"
+      break
     fi
+  done
+}
+
+function check_erlang_release() {
+  local elixir_version erlang_version low high
+  elixir_version="${1}"
+  erlang_version="$(erlv)"
+
+  case "${elixir_version}" in
+  v1.0.* | v1.1.*) low=17 ;;
+  v1.2.* | v1.3.* | v1.4.* | v1.5.*) low=18 ;;
+  v1.6.* | v1.7.*) low=19 ;;
+  v1.8.* | v1.9.*) low=20 ;;
+  v1.10.* | v1.11.* | v1.12.*) low=21 ;;
+  v1.13.* | master | main | *) low=22 ;;
+  esac
+
+  high=$((low + 2))
+
+  if ((erlang_version < low)); then
+    halt 1 "Elixir ${elixir_version} requires at least Erlang ${low}."
+  fi
+
+  if ((erlang_version > high)); then
+    info "Elixir ${elixir_version} is known to work with Erlang ${low} – ${high}."
   fi
 }
 
 function bin_found() {
   if [ -z "${1}" ]; then
     false
-  elif [ -z "$(which ${1} 2>/dev/null)" ]; then
+  elif [ -z "$(which "${1}" 2>/dev/null)" ]; then
     error "ERROR: ${1} not found in \$PATH"
     false
   else
@@ -293,7 +290,7 @@ function deps_check() {
     errors=$((errors + 1))
   fi
 
-  if [[ "${system}" = FreeBSD ]] && ! bin_found gmake; then
+  if [[ "${distro}" = freebsd ]] && ! bin_found gmake; then
     error "\tInstall gmake and try again."
     errors=$((errors + 1))
   fi
@@ -445,8 +442,11 @@ function setup() {
 
   create_kx_env_script
 
-  find "${elixirs_path}" -maxdepth 1 -mindepth 1 -type d \
-    -exec basename {} \; | sort | read -a elixirs
+  # shellcheck disable=SC2207
+  elixirs=($(
+    find "${elixirs_path}" -maxdepth 1 -mindepth 1 -type d \
+      -exec basename {} \; | sort
+  ))
 
   for version in "${elixirs[@]}"; do
     [[ -x "${elixirs_path}/${version}/bin/elixir" ]] || continue
@@ -486,8 +486,7 @@ function kx_implode() {
   local resp verbose
   verbose=true
 
-  printf "Type YES to remove the kx install and all Elixir versions: "
-  read resp
+  read -r -p "Type YES to remove the kx install and all Elixir versions: " resp
 
   if [[ "${resp}" != "YES" ]]; then
     info "Aborting kx implode."
@@ -502,121 +501,128 @@ function kx_implode() {
   info "\t[[ -s \"\$HOME/.kx/scripts/kx\" ]] && source \"\$HOME/.kx/scripts/kx\""
 }
 
+function extract_values() {
+  tr ',' '\n' | grep "\"${1}\":" | sed -E "s/.*\"${1}\":\"([^\"]*)\"/\1/"
+}
+
+function indent_values() {
+  sed 's/^/    /'
+}
+
+function cache_file() {
+  echo "${base_path}/.cached_${1}.${KX_REPO_OWNER}"
+}
+
+function cache_needs_refresh() {
+  local file
+  if [[ "${1}" =~ "/" ]]; then
+    file="${1}"
+  else
+    file="$(cache_file "${1}")"
+  fi
+
+  if "${force}"; then
+    true
+  elif [[ -s "${file}" ]]; then
+    local -i now ftime
+    now="$(date +%s)"
+    ftime="$(date -r "${file}" +%s)"
+    ((now - ftime >= 86400))
+  else
+    true
+  fi
+}
+
 function get_elixir_branches() {
-  curl_github_api "${KX_REPO}" branches | grep '"name":' |
-    tr ',' '\n' | grep name\": | sed 's/.*name":"\([^"]*\)"/\1/' | sed 's/^/    /'
+  local cache_file
+  cache_file="$(cache_file branches)"
+  if cache_needs_refresh "${cache_file}"; then
+    curl_github_api branches | extract_values name | indent_values |
+      tee "${cache_file}"
+  else
+    cat "${cache_file}"
+  fi
 }
 
 function list_branches() {
-  info "Getting the available branches from https://github.com/${KX_REPO}/branches\n"
-  elixir_branches=$(get_elixir_branches)
+  if cache_needs_refresh branches; then
+    info "Getting branches from https://github.com/${KX_REPO_OWNER}/elixir/branches\n"
+  fi
 
   info "Current Elixir branches:"
-  printf "%b" "${elixir_branches}\n"
+  printf "%b" "$(get_elixir_branches)\n"
 }
 
-# function get_cached_elixir_releases() {
-#   tail -n +2 $cached_release_list
-# }
-#
-# function get_cached_releases_etag() {
-#   xetag=$(grep "^#Etag:" $cached_release_list)
-#   echo ${xetag//#Etag:}
-# }
-#
-# function update_release_cache() {
-#   x="$*"
-#   xetag=$(echo $x|grep ETag)
-#   xetag=${xetag//ETag: /}
-#   xetag=${xetag//"/}
-#   new_etag=${xetag//ETag: /}
-#   cached_etag=$(get_cached_releases_etag)
-#   echo "$x"
-# }
-
 function get_known_elixir_releases() {
-  # TODO: finish adding caching support with etags
-  # xetag=$(curl -i -H "User-Agent: ${user_agent}" -qs https://api.github.com/repos/elixir-lang/elixir/releases |grep "^ETag")
-  # etag=${xetag//Etag: "/}
-  #
-  #   x=$(curl -i -H "User-Agent: ${user_agent}" -H "Accept: application/json" -qs https://api.github.com/repos/elixir-lang/elixir/releases |grep '"tag_name":|ETag')
-  #   xetag=$(echo $x|grep ETag)
-  #   x=$(echo $x|grep -v ETag)
-
-  x=$(\curl -i ${auth_header[*]} -H "User-Agent: ${user_agent}" -H 'Accept: application/json' -qs "https://api.github.com/repos/elixir-lang/elixir/releases?per_page=100" | tr ',' '\n' | grep '"tag_name":')
-  x=${x//\"tag_name\":/}
-  x=${x//[\",]/}
-  x=${x//v/}
-
-  # update_release_cache "$x"
-  echo "$x" | sed 's/^/    /' | sort -t. -k 1,1n -k 2,2n -k 3,3n -k 4,4n
+  local cache_file
+  cache_file="$(cache_file releases)"
+  if cache_needs_refresh "${cache_file}"; then
+    curl_github_api releases per_page=100 | extract_values tag_name |
+      indent_values | sort -V | tee "${cache_file}"
+  else
+    cat "${cache_file}"
+  fi
 }
 
 function get_latest_elixir_release() {
-  x=$(curl -i ${auth_header[*]} -H "User-Agent: ${user_agent}" -H 'Accept: application/json' -qs https://api.github.com/repos/elixir-lang/elixir/releases/latest | tr ',' '\n' | grep '"tag_name":' | sed -E 's/"tag_name":"v(.+)"$/\1/')
-
-  echo "$x"
+  curl_github_api releases/latest | extract_values tag_name
 }
 
 function list_known() {
-  echo "Getting the available releases from https://github.com/elixir-lang/elixir/releases"
-  echo
-  elixir_releases=$(get_known_elixir_releases)
-  #elixir_releases=$x
+  if cache_needs_refresh releases; then
+    info "Getting releases from https://github.com/${KX_REPO_OWNER}/elixir/releases\n"
+  fi
 
-  echo "Known Elixir releases: "
-  printf "%b" "${elixir_releases}\n"
+  info "Known Elixir releases: "
+  printf "%b" "$(get_known_elixir_releases)\n"
 }
 
 function get_latest() {
-  echo "Getting the latest release from https://github.com/elixir-lang/elixir/releases/latest"
-  # add empty line
-  echo
-  local latest_release=$(get_latest_elixir_release)
-  echo "Latest release is ${latest_release}"
-  # add empty line
-  echo
-  read -p "Do you want to install it? [y/n]" -n 1 -r
+  info "Getting latest release from https://github.com/${KX_REPO_OWNER}/elixir/releases/latest\n"
+
+  local latest_release
+  latest_release=$(get_latest_elixir_release)
+
+  read -p "Do you want to install ${latest_release}? [y/N]" -n 1 -r
 
   if [[ $REPLY =~ ^[Yy]$ ]]; then
-    install_elixir $latest_release
+    install_elixir "$latest_release"
   fi
 }
 
 function valid_known_release() {
-  ver="$1"
-  get_known_elixir_releases | grep -q "$1$" 2>/dev/null
-  echo $?
+  grep -q "${1}$" <(get_known_elixir_releases) 2>/dev/null
 }
 
 function valid_branch() {
-  ver="$1"
-  get_elixir_branches | grep -q "$1" 2>/dev/null
-  echo $?
+  grep -q "${1}" <(get_elixir_branches) 2>/dev/null
 }
 
 function exit_on_invalid_version() {
+  local version
   version="$1"
 
-  if [ ! "$(valid_known_release ${version})" = 0 -a ! "$(valid_branch ${version})" = 0 ]; then
-    echo "Unknown Elixir '$version' ☹ "
-    echo -e "Try\n\tkx list known -- known releases\n\tkx list branches -- current branches"
-    exit 1
+  if ! valid_known_release "${version}" && ! valid_branch "${version}"; then
+    halt 1 "Unknown Elixir '${version}'."
   fi
 }
 
+function clone_elixir_repository() {
+  :
+}
+
 function install_elixir() {
-  ver="$1"
-  ver=${ver//v/}
+  local version ver major mp name
+  version="${1}"
+  ver="${version//v/}"
   major=${ver%%.[0-9]*}
   mp=${ver#[0-9]*.}
   minor=${mp%.*[0-9]}
-  patch=${ver##*[0-9].}
-  if (($major >= 1)) || (($minor > 12)) || (($ver == "master")); then
-    need_erl_17=1
-  fi
 
-  if [ "$need_erl_17" = 1 ]; then
+  local erlang_min_release_full erlang_min_release erlang_before_release_full \
+    erlang_min_release_candidate erlang_min_release_candidate_n
+
+  if ((major >= 1 || minor > 12)) || [[ "$version" == "master" ]]; then
     erlang_min_release_full="R17"
     erlang_min_release=17
     erlang_min_release_candidate=""
@@ -630,20 +636,31 @@ function install_elixir() {
     erlang_min_release_candidate_n=""
   fi
 
-  version="$1"
+  name="${2:-$version}"
 
   exit_on_invalid_version "$1"
   exit_on_unmet_prereqs
 
-  install_path="${elixirs_path}/elixir-${version}"
+  install_path="${elixirs_path}/elixir-${name}"
 
-  cd "$build_path"
-  echo "Downloading elixir version ${version}"
-  git clone https://github.com/elixir-lang/elixir.git elixir-git 2>/dev/null
-  cd elixir-git
-  echo "Installing elixir version ${version}"
-  git checkout -f master
-  git fetch -t
+  if [[ -f "${install_path}/bin/elixir" ]]; then
+    halt 1 "There is a version of Elixir already installed as ${name}."
+  fi
+
+  cd "${build_path}" || halt 1 "Error building Elixir."
+
+  info "Downloading Elixir version ${version}."
+
+  [[ -d "${build_path}"/elixir-git ]] ||
+    command git clone https://github.com/"${KX_REPO_OWNER}"/elixir.git elixir-git 2>/dev/null
+
+  cd elixir-git || halt 1 "Error building Elixir."
+
+  info "Installing Elixir version ${version}."
+
+  command git checkout -f master || command git checkout -f main
+  command git fetch -tp
+
   # TODO: deal with conflicts between branches and tags
   git branch -la | grep -q "origin/${version}"
   if [ "$?" = 0 ]; then
@@ -654,7 +671,7 @@ function install_elixir() {
     git pull origin "v${version}"
   fi
 
-  if [ "${system}" = "FreeBSD" ]; then
+  if [ "${system}" = "freebsd" ]; then
     MAKE=gmake
   else
     MAKE=make

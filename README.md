@@ -1,8 +1,28 @@
-# kiex - Elixir version manager
+# kx - Elixir Version Manager
 
-Kiex allows you to easily build and switch between different [Elixir] versions.
-It supports setting the default (global) Elixir version as well as per
-shell/project versions. Everything is self-contained under `~/.kiex`.
+Kx allows you to easily build and switch between different [Elixir] versions. It
+supports setting the default (global) Elixir version as well as per-shell or
+per-project versions. Everything is self-contained under one directory, by
+default `~/.kx`.
+
+Kx is forked from [kiex], but has a few key differences:
+
+- It focuses on modern Elixirs (at least v1.0.0), and support is provided for
+  v1.7.0 or later. Support ages out one release _behind_ Elixir support (v1.7.0
+  support will be dropped after the release of v1.13.0).
+
+- It is aware of the version of Erlang used to build Elixir with and the
+  installed version of Elixir has the Erlang version attached. The full
+  Erlang/OTP release value is used if possible.
+
+- Releases are installed from the `elixir-lang/elixir` repo using the release
+  tarballs.
+
+- Branches can be installed from any `elixir` repo (e.g., `sorentwo/elixir`) and
+  will be built in the `git` work tree.
+
+- Installed builds can be given alternate names (the OTP version is still
+  attached to that build).
 
 Usage is based _lightly_ on [RVM], [kerl], and [rbenv].
 
@@ -18,12 +38,13 @@ which will install in `$HOME/.kiex`.
 
 ### Prerequisites
 
-- bash 3.x+
-- curl
-- erlang
-- git
-- make
-- openssl
+- `bash` 3.x+
+- `curl`
+- `erlang`
+- `git`
+- `make` (or `gmake` on FreeBSD)
+- `openssl`
+- `jq`
 
 ## Usage
 
@@ -187,8 +208,9 @@ Erlang installs:
 
 [LICENSE](LICENSE.md)
 
-[elixir]: http://elixir-lang.org/
-[rvm]: http://rvm.io
+[kiex]: https://github.com/taylor/kiex
+[elixir]: https://elixir-lang.org/
+[rvm]: https://rvm.io
 [kerl]: https://github.com/spawngrid/kerl
 [rbenv]: https://github.com/sstephenson/rbenv
 [exenv]: https://github.com/mururu/exenv

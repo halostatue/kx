@@ -1,4 +1,4 @@
-# kiex Changelog
+# kx Changelog
 
 ## 2.0 / 2021-04-18
 
@@ -6,6 +6,13 @@
 - Applied cleanups based on `shellcheck`.
 - Formatted with `shfmt`.
 - Removed the _generic_ startup script.
+- Support for Elixir versions older than 1.0 is hard deprecated; those releases
+  are explicitly filtered.
+- No support will be given for Elixir versions older than 1.7.
+- The Elixir version installed is tagged with the Erlang/OTP release used at
+  build time.
+- The Elixir version selected is tagged with the Erlang/OTP release used at
+  at `use` time.
 
 ### Notes on Issues in [taylor/kiex]
 
