@@ -1,0 +1,1675 @@
+#!/usr/bin/env bash
+
+declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
+
+data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+KX_HOME="$(
+  cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
+  pwd -P
+)/$(basename "${KX_HOME:-${data_home}/kx}")"
+kx_version="1.0.0"
+kx_user_agent="kx-elixir-installer ${kx_version}"
+kx_issues_url="https://github.com/halostatue/kx/issues/new"
+kx_url="https://raw.githubusercontent.com/halostatue/kx/main/kx"
+kx_banner="kx: Install and Manage Elixir Versions (${kx_version})"
+
+readonly KX_HOME KX_OAUTH_TOKEN kx_version kx_user_agent kx_issues_url \
+  kx_url kx_banner data_home
+
+function printable_script() {
+  local script
+  script="${1/${XDG_DATA_HOME}/\$XDG_DATA_HOME}"
+  echo "${script/${HOME}/\$HOME}"
+}
+
+declare base_path bin_path kx_path build_path scripts_path elixirs_path \
+  mix_archives_path mix_archives_source_path usershell system default_repo \
+  erlv erl shellname
+
+base_path="${KX_HOME}"
+bin_path="${base_path}/bin"
+kx_path="${bin_path}/kx"
+build_path="${base_path}/builds"
+scripts_path="${base_path}/scripts"
+elixirs_path="${base_path}/elixirs"
+mix_archives_path="${base_path}/mix/archives"
+mix_archives_source_path="$(printable_script "${KX_HOME}/mix/archives}")"
+default_repo=elixir-lang/elixir
+erl="$(command -v erl)"
+erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
+
+# Running bash -l from csh does not change $SHELL
+shellname="$(basename "${SHELL}")"
+usershell="${USERSHELL:-${shellname}}"
+system="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+readonly base_path bin_path kx_path build_path scripts_path elixirs_path \
+  mix_archives_path mix_archives_source_path usershell system default_repo \
+  shellname
+
+declare -a headers api_headers
+headers=(-H "User-Agent: ${kx_user_agent}")
+
+[[ -n "${KX_OAUTH_TOKEN}" ]] &&
+  headers=("${headers[@]}" -H "Authorization: Token ${KX_OAUTH_TOKEN}")
+
+api_headers=(-H "Accept: application/vnd.github.v3+json" "${headers[@]}")
+
+readonly headers api_headers
+
+declare quiet verbose force usershell elixir_repo update reinstall
+
+verbose=false
+quiet=false
+force=false
+update=false
+reinstall=false
+elixir_repo="${default_repo}"
+
+function info() {
+  if "${verbose}" || ! "${quiet}"; then
+    if (($#)); then
+      printf "%b\n" "${*}"
+    else
+      printf "%b" "$(cat -)"
+    fi
+  fi
+}
+
+function error() {
+  if (($#)); then
+    printf >&2 "%b\n" "${*}"
+  else
+    cat - >&2
+  fi
+}
+
+function halt() {
+  local -i status
+  status=0
+
+  if [[ "$1" =~ ^[[:digit:]]+$ ]]; then
+    status="$1"
+    shift
+  fi
+
+  if [[ "$1" == usage: ]]; then
+    shift
+    usage "$@"
+    set --
+  fi
+
+  (($#)) && error "$@"
+  builtin exit "${status}"
+}
+
+function build_failure() {
+  error "A problem occurred with the Elixir build. Aborting!\n"
+
+  (($#)) && error "    ${*}"
+
+  error "\nPlease report an issue at ${kx_issues_url}"
+  halt 1
+}
+
+function join_array() {
+  local joiner result part
+  joiner="$1"
+  result="$2"
+  shift 2
+
+  for part in "$@"; do
+    result="${result}${joiner}${part}"
+  done
+
+  echo "${result}"
+}
+
+function github() {
+  local action params
+  action="$1"
+  shift
+
+  (($#)) && params="?$(join_array "&" "$@")"
+
+  command curl -qsSL "${api_headers[@]}" \
+    "https://api.github.com/repos/${elixir_repo}/${action}${params}" ||
+    halt $? "Error calling Github for '${*}': $?."
+}
+
+function github_paginated() {
+  local tmpdir current_file
+  local -i page current_size
+  tmpdir="$(mktemp -d)"
+
+  for ((page = 1; ; ++page)); do
+    current_file="$(printf "%s/%03d.json" "${tmpdir}" "${page}")"
+    current_size="$(
+      github "$@" per_page=100 page="${page}" | tee "${current_file}" |
+        jq length
+    )"
+
+    if ((current_size < 100)); then
+      break
+    else
+      ((++page))
+    fi
+  done
+
+  jq -c '[.[][]]' -s "${tmpdir}"/*.json
+}
+
+function download_kx() {
+  mkdir -p "${bin_path}"
+  command curl -sSL "${headers[@]}" -o "${kx_path}" "${kx_url}" ||
+    halt $? "Error downloading kx from ${kx_url}: $?"
+  chmod +x "${kx_path}"
+}
+
+function valid_version() {
+  read_elixir_releases __raw __field __version "$1" | grep -sq "$1"
+}
+
+function valid_branch() {
+  read_elixir_branches __raw __field __branch "$1" | grep -sq "$1"
+}
+
+function download_elixir_tarball() {
+  local tarball_url
+  tarball_url="$(
+    read_elixir_releases --version "${version}" | jq -r '.[0].tarball_url'
+  )" || build_failure "Reading tarball URL for ${version}"
+
+  command curl -sSL "${headers[@]}" "${tarball_url}" |
+    tar xfz - --strip-components 1 -C "${version}" ||
+    build_failure "Downloading ${tarball_url} for ${version}"
+}
+
+function build_elixir_tarball() {
+  rm -rf "${version}"
+  mkdir -p "${version}"
+
+  download_elixir_tarball
+
+  cd "${version}" || build_failure "cd ${version}"
+
+  build_elixir
+}
+
+function clone_elixir_repository() {
+  [[ -d "${build_path}"/elixir-git ]] ||
+    command git clone https://github.com/"${default_repo}".git \
+      "${build_path}"/elixir-git 2>/dev/null
+
+  cd elixir-git || build_failure "cd ${build_path}/elixir-git"
+
+  command git checkout -f master >/dev/null 2>/dev/null ||
+    command git checkout -f main >/dev/null 2>/dev/null ||
+    build_failure "git checkout -f master || git checkout -f main"
+
+  command git fetch --all --tags --prune >/dev/null ||
+    build_failure "git fetch --all --tags --prune"
+
+  local origin
+  origin=origin
+
+  if [[ "${elixir_repo}" != "${default_repo}" ]]; then
+    origin="${elixir_repo/\//_}"
+
+    if ! git remote -v | grep -sq "${elixir_repo}"; then
+      git add remote "${origin}" "${elixir_repo}" >/dev/null 2>dev/null ||
+        build_failure "git add remote ${origin} ${elixir_repo}"
+    fi
+  fi
+
+  git checkout -f "${origin}/${branch}" >/dev/null 2>/dev/null ||
+    build_failure "git checkout -f ${origin}/${branch}"
+}
+
+function build_elixir_repository() {
+  clone_elixir_repository
+  build_elixir
+}
+
+function build_elixir() {
+  local MAKE
+  MAKE="make"
+
+  info "Installing Elixir version ${version}."
+
+  [[ "${system}" == FreeBSD ]] && MAKE=gmake
+
+  "${MAKE}" clean compile || build_failure "${MAKE} clean compile"
+
+  mkdir -p "${install_path}"
+
+  "${MAKE}" "PREFIX=${install_path}" install ||
+    build_failure "${MAKE} PREFIX=${install_path} install"
+
+  mkdir -p "${mix_archives_path}/${version_path}"
+  create_build_env_files
+
+  output_version="${name}"
+  [[ "${version}" != "${name}" ]] && output_version="${version} as ${name}"
+  info "\nInstalled Elixir version ${output_version} (Erlang/OTP ${erlang_version})"
+
+  local script
+  script="source $(printable_script "${elixirs_path}/${version_path}.env")"
+  case "${shellname}" in
+  fish) script="${script}.fish" ;;
+  csh | tcsh) script="${script}.csh" ;;
+  esac
+
+  info <<INFO
+Load with:
+
+\tkx use ${name}
+
+or load the Elixir environment file with:
+
+\t${script}
+INFO
+}
+
+function erlv_full() {
+  local e f
+  local -a ff
+  e="$(dirname "$(dirname "${erl}")")"
+  ff=(
+    "${e}/releases/${erlv}/OTP_VERSION"
+    "${e}/lib/erlang/releases/${erlv}/OTP_VERSION"
+    "${e}/releases/${erlv}/OTP_RELEASE"
+    "${e}/lib/erlang/releases/${erlv}/OTP_RELEASE"
+  )
+
+  for f in "${ff[@]}"; do
+    if [[ -f "${f}" ]]; then
+      cat "${f}"
+      break
+    fi
+  done
+}
+
+function check_minimum_erlang_release() {
+  local elixir_version
+  local -i low high erlang_version
+  high=-1
+  elixir_version="$1"
+
+  case "${elixir_version}" in
+  1.0.* | v1.0.* | 1.1.* | v1.1.*) low=17 ;;
+  1.2.* | v1.2.* | 1.3.* | v1.3.* | 1.4.* | v1.4.* | 1.5.* | v1.5.*) low=18 ;;
+  1.6.* | v1.6.* | 1.7.* | v1.7.*) low=19 ;;
+  1.8.* | v1.8.* | 1.9.* | v1.9.*) low=20 ;;
+  1.10.* | v1.10.* | 1.11.* | v1.11.* | 1.12.* | v2.11.*) low=21 ;;
+  *) return 0 ;;
+  esac
+
+  ((high == -1)) && high=$((low + 2))
+
+  erlang_version="${erlv}"
+
+  if ((erlang_version < low)); then
+    halt 1 "Elixir ${elixir_version} requires at least Erlang ${low}."
+  fi
+
+  if ((erlang_version > high)); then
+    info "Elixir ${elixir_version} is known to work with Erlang ${low} – ${high}."
+  fi
+}
+
+function has_command() {
+  (($#)) || builtin return 1
+
+  builtin command -v "${@}" >/dev/null
+}
+
+function has_function() {
+  (($#)) || builtin return 1
+
+  builtin declare -fF "${@}" >/dev/null
+}
+
+function backup_script() {
+  if [[ -f "$1" ]] && [[ -n "${backup}" ]]; then
+    cp "$1" "$1.bak.${backup}"
+  fi
+}
+
+function create_kx_env_script_bash() {
+  backup_script "${scripts_path}/kx.bash"
+
+  cat >"${scripts_path}/kx.bash" <<"EOF"
+KX_HOME="${KX_HOME:-${HOME}/.kx}"
+export PATH="${KX_HOME}/bin:${PATH}"
+[[ -f "${KX_HOME}"/elixirs/.default ]] && source "${KX_HOME}"/elixirs/.default
+
+function kx() {
+  if [[ "$1" = "use" ]]; then
+    source_line="$(USERSHELL=notcsh "${KX_HOME}"/bin/kx "$[@]" | grep source)"
+    if [[ -z "${source_line}" ]]; then
+      echo "Failed to ${*}" >&2
+      return 1
+    else
+      eval "${source_line}"
+      shift
+      echo "Using ${*}"
+    fi
+  else
+    "${KX_HOME}/bin/kx" "$@"
+  fi
+}
+EOF
+}
+
+function create_kx_env_script_csh() {
+  backup_script "${scripts_path}/kx.csh"
+
+  cat >"${scripts_path}/kx.csh" <<"EOF"
+if ( ! $?KX_HOME ) then
+  setenv KX_HOME="$HOME/.kx"
+endif
+setenv PATH "$KX_HOME/bin:$PATH"
+
+if ( -f $KX_HOME/elixirs/.default.csh ) then
+  source $KX_HOME/elixirs/.default.csh
+endif
+EOF
+}
+
+function create_kx_env_script_fish() {
+  backup_script "${scripts_path}/kx.fish"
+
+  cat >"${scripts_path}/kx.fish" <<"EOF"
+set -q KX_HOME; or set KX_HOME $HOME/.kx
+set -gx PATH $KX_HOME/bin $PATH
+
+if test -f $KX_HOME/elixirs/.default.fish
+  source $KX_HOME/elixirs/.default.fish
+end
+
+function kx
+    if set -q argv[1]; and test $argv[1] = use
+        set -lx USERSHELL $SHELL
+        set -l source_line ($KX_HOME/bin/kx $argv | string match -e source)
+
+        if test -z "$source_line"
+            echo "Failed to $argv" >&2
+            return 1
+        else
+            eval $source_line
+            set -e argv[1]
+            echo "Using $argv"
+        end
+    else
+        $KX_HOME/bin/kx $argv
+    end
+end
+EOF
+}
+
+function create_kx_env_scripts() {
+  local backup
+  backup="$(date +%Y%m%d.%H%M)"
+
+  create_kx_env_script_bash
+  create_kx_env_script_csh
+  create_kx_env_script_fish
+}
+
+function jq_filter() {
+  local file field raw arg extract_field filters
+  local -a filter
+  file="$1"
+  field="$2"
+  raw=false
+  extract_field=false
+
+  shift 2
+
+  filter=("map(select(.${field} | contains(\"v0.\") != true))")
+
+  while (($#)); do
+    case "$1" in
+    --prerelease-only | -P)
+      filter=("${filter[@]}" "map(select(.prerelease == true))")
+      ;;
+    --release-only | -R)
+      filter=("${filter[@]}" "map(select(.prerelease == false))")
+      ;;
+    __raw) raw=true ;;
+    __version)
+      if ! ((${#2})); then
+        halt 1 "Cannot filter on version without a version to compare."
+      fi
+
+      case "$2" in
+      v*) filter=("${filter[@]}" "map(select(.tag_name == \"$2\"))") ;;
+      *) filter=("${filter[@]}" "map(select(.tag_name == \"v$2\"))") ;;
+      esac
+
+      shift
+      ;;
+    __branch)
+      if ! ((${#2})); then
+        halt 1 "Cannot filter on branch without branch to compare."
+      fi
+
+      filter=("${filter[@]}" "map(select(.name == \"$2\"))")
+      shift
+      ;;
+    __field) extract_field=true ;;
+    *) : ;;
+    esac
+
+    shift
+  done
+
+  if "${extract_field}"; then
+    filter=("${filter[@]}" ".[].${field}")
+  fi
+
+  filters="$(join_array '|' "${filter[@]}")"
+
+  if "${raw}"; then
+    jq <"${file}" -r "${filters}"
+  else
+    jq <"${file}" "${filters}"
+  fi
+}
+
+function indent_values() {
+  sed 's/^/    /'
+}
+
+function cache_file() {
+  local suffix
+  [[ "$1" == branches ]] && suffix=".${elixir_repo%/elixir}"
+  echo "${base_path}/.cached_$1${suffix/\//_}"
+}
+
+function cache_needs_refresh() {
+  local file
+  if [[ "$1" =~ "/" ]]; then
+    file="$1"
+  else
+    file="$(cache_file "$1")"
+  fi
+
+  if "${force}"; then
+    true
+  elif [[ -s "${file}" ]]; then
+    local -i now ftime
+    now="$(date +%s)"
+    ftime="$(date -r "${file}" +%s)"
+    ((now - ftime >= 86400))
+  else
+    true
+  fi
+}
+
+function read_elixir_branches() {
+  local cache_file
+  cache_file="$(cache_file branches)"
+  cache_needs_refresh "${cache_file}" &&
+    github_paginated branches >"${cache_file}"
+
+  jq_filter "${cache_file}" name "${@}"
+}
+
+function get_elixir_branches() {
+  read_elixir_branches __raw __field | indent_values | sort -V
+}
+
+function read_elixir_releases() {
+  local cache_file elixir_repo
+  elixir_repo="${default_repo}"
+  cache_file="$(cache_file releases)"
+  cache_needs_refresh "${cache_file}" &&
+    github_paginated releases >"${cache_file}"
+
+  jq_filter "${cache_file}" tag_name "${@}"
+}
+
+function get_elixir_releases() {
+  read_elixir_releases __raw __field "${@}" | sed 's/^v//' | indent_values | sort -V
+}
+
+function get_latest_elixir_release() {
+  github releases/latest | jq -r ".tag_name" | sed 's/^v//'
+}
+
+function find_elixir_version() {
+  local target version_path otp_version match
+  local -a installed
+  args=()
+  match=false
+  otp_version="$(erlv_full)"
+
+  while (($#)); do
+    case "$1" in
+    --otp-major) otp_version="${erlv}" ;;
+    *) : ;;
+    esac
+
+    shift
+  done
+
+  if (($#)); then
+    target="$1"
+  elif [[ -f .elixir-version ]]; then
+    target="$(head -1 .elixir-version)"
+  fi
+
+  # shellcheck disable=SC2207
+  installed=($(installed_elixirs | sort -Vr))
+
+  for version_path in "${installed[@]}"; do
+    [[ -x "${elixirs_path}/${version_path}/bin/elixir" ]] || continue
+    [[ -f "${elixirs_path}/${version_path}.env" ]] || continue
+
+    [[ "${version_path}" == "${target}" ]] && match=true
+    [[ "${version_path}" =~ elixir-"${target}"-otp-"${otp_version}" ]] && match=true
+
+    "${match}" || continue
+
+    echo "${version_path}"
+    return 0
+  done
+
+  halt 1 "Elixir version ${target} not found for Erlang/OTP ${otp_version}." \
+    "Try installing it."
+}
+
+function create_build_env_files() {
+  local new_path new_mix_path
+
+  new_path="$(printable_script "${elixirs_path}/${version_path}/bin")"
+  new_mix_path="$(printable_script "${mix_archives_source_path}/${version_path}")"
+
+  ## Bash and Zsh
+  backup_script "${elixirs_path}/${version_path}.env"
+  cat >"${elixirs_path}/${version_path}.env" <<EOF
+export ELIXIR_VERSION="${version_path}"
+export PATH="${new_path}:\$PATH"
+export MIX_ARCHIVES="${new_mix_path}"
+EOF
+
+  ## Csh and Tcsh
+  backup_script "${elixirs_path}/${version_path}.env.csh"
+  cat >"${elixirs_path}/${version_path}.env.csh" <<EOF
+setenv ELIXIR_VERSION "${version_path}"
+setenv PATH "${new_path}:\$PATH"
+setenv MIX_ARCHIVES "${new_mix_path}"
+EOF
+
+  ## Fish
+  backup_script "${elixirs_path}/${version_path}.env.fish"
+  cat >"${elixirs_path}/${version_path}.env.fish" <<EOF
+set -gx ELIXIR_VERSION "${version_path}"
+set -gx PATH "${new_path}" \$PATH
+set -gx MIX_ARCHIVES "${new_mix_path}"
+EOF
+
+  cat >"${elixirs_path}/${version_path}/.kx-version" <<EOF
+{"version":"${version}","name":"${name}"}
+EOF
+}
+
+function do_install_kx() {
+  if [[ -x "${kx_path}" ]]; then
+    exec "${kx_path}" self update
+  else
+    do_doctor --installing-kx --only-errors
+    download_kx
+
+    info "Running initial environment setup.\n"
+    exec "${kx_path}" setup
+  fi
+}
+
+function usage_doctor() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx doctor
+
+Checks the installation of kx and required dependencies.
+USAGE
+}
+
+function do_doctor() {
+  local verify_paths verify_system
+  local -a errors fixes
+  verify_paths=true
+  verify_system=false
+  errors=()
+  fixes=()
+
+  while (($#)); do
+    case "$1" in
+    --help | -h | -\? | help) halt usage: doctor ;;
+    --only-errors)
+      local quiet
+      quiet=true
+      ;;
+    --installing-kx)
+      verify_paths=false
+      verify_system=true
+      ;;
+    esac
+
+    shift
+  done
+
+  info "kx doctor - Checking for errors in configuration"
+
+  if "${verify_system}"; then
+    case "${system}" in
+    linux | freebsd | darwin) : ;;
+    *)
+      error "Operating system ${system} is not explicitly supported by kx."
+      if "${force}"; then
+        error "Continuing install; --force was specified."
+      else
+        halt 1 "Cancelling. Use --force to install anyway."
+      fi
+      ;;
+    esac
+  fi
+
+  if "${verify_paths}"; then
+    local miss
+    miss=false
+
+    for d in "${build_path}" "${elixirs_path}" "${scripts_path}" "${bin_path}"; do
+      if [[ ! -d "${d}" ]]; then
+        miss=true
+        break
+      fi
+    done
+
+    if "${miss}"; then
+      errors=("${errors[@]}" "kx paths are not set up.")
+      fixes=("${fixes[@]}" "Please run 'kx setup'.")
+    fi
+  fi
+
+  if ! has_command jq; then
+    errors=("${errors[@]}" "jq is not in \$PATH.")
+    fixes=("${fixes[@]}" "Install jq.")
+  fi
+
+  if ! has_command erl; then
+    errors=("${errors[@]}" "erl is not in \$PATH.")
+    fixes=("${fixes[@]}" "Install Erlang.")
+  fi
+
+  if ! has_command git; then
+    errors=("${errors[@]}" "git is not in \$PATH.")
+    fixes=("${fixes[@]}" "Install git.")
+  fi
+
+  if [[ "${system}" == freebsd ]] && ! has_command gmake; then
+    errors=("${errors[@]}" "gmake is not in \$PATH and is required on $(uname -s).")
+    fixes=("${fixes[@]}" "Install gmake.")
+  fi
+
+  if ((${#errors[@]} > 0)); then
+    if ((${#errors[@]} > 1)); then
+      info "\nErrors were found:"
+    else
+      info "\nAn error was found:"
+    fi
+
+    local msg
+    for msg in "${errors[@]}"; do
+      error "- ${msg}"
+    done
+
+    if ((${#fixes[@]} > 1)); then
+      info "\nThey can be fixed:"
+    else
+      info "\nIt can be fixed:"
+    fi
+
+    local msg
+
+    for msg in "${fixes[@]}"; do
+      info "- ${msg}"
+    done
+
+    halt "${#errors[@]}"
+  else
+    info "No errors found."
+  fi
+}
+
+function in_profile_file() {
+  grep -sv '^#' "$1" | grep -isq 'source.*/scripts/kx' && echo "$1"
+}
+
+function do_setup() {
+  local arg in_bashrc in_profile in_bash_profile in_zshrc in_zsh_profile \
+    in_fish_config version_path
+  local -a installed source_found
+
+  in_bashrc="$(in_profile_file "${HOME}"/.bashrc)"
+  in_profile="$(in_profile_file "${HOME}"/.profile)"
+  in_bash_profile="$(in_profile_file "${HOME}"/.bash_profile)"
+  in_zshrc="$(in_profile_file "${HOME}"/.zshrc)"
+  in_zsh_profile="$(in_profile_file "${HOME}"/.zsh_profile)"
+  in_fish_config="$(in_profile_file "${XDG_CONFIG_HOME:-${HOME}/.config}/fish/config.fish")"
+
+  source_found=()
+  for arg in "${in_bashrc}" "${in_profile}" "${in_bash_profile}" "${in_zshrc}" \
+    "${in_zsh_profile}" "${in_fish_config}"; do
+    source_found=("${source_found[@]}" "${arg}")
+  done
+
+  if ((${#source_found})); then
+    info "Kx sourcing line found in:"
+    for arg in "${source_found[@]}"; do
+      info "\t- ${arg}"
+    done
+  else
+    info "Kx sourcing line not found in any of:"
+    info "\t- ~/.bashrc"
+    info "\t- ~/.bash_profile"
+    info "\t- ~/.profile"
+    info "\t- ~/.zshrc"
+    info "\t- ~/.zsh_profile"
+    info "\t- ${XDG_CONFIG_HOME:-~/.config}/fish/config.fish"
+  fi
+
+  mkdir -p "${KX_HOME}"/{bin,builds,elixirs,scripts,mix/archives}
+
+  create_kx_env_scripts
+
+  # shellcheck disable=SC2207
+  installed=($(installed_elixirs))
+
+  for version_path in "${installed[@]}"; do
+    [[ -x "${elixirs_path}/${version_path}/bin/elixir" ]] || continue
+    mkdir -p "${mix_archives_path}/${version_path}"
+    create_build_env_files
+  done
+
+  if ((!${#found[@]})); then
+    info "\nAdd the following to your shell's config file:\n"
+
+    local script
+    script="$(printable_script "${scripts_path}/kx")"
+
+    case "${shellname}" in
+    fish) script="${script}.fish" ;;
+    csh | tcsh) script="${script}.csh" ;;
+    *) script="${script}.bash" ;;
+    esac
+
+    info "\ttest -s \"${script}\" && source \"${script}\""
+  fi
+
+  if "${update}"; then
+    info "\nkx installed in ${KX_HOME} is now updated."
+  else
+    info "\nkx has been installed in ${KX_HOME}."
+  fi
+}
+
+function do_self_update() {
+  cd "${bin_path}" || halt 1 "Cannot change to ${bin_path}"
+
+  local backup
+  backup="$(date +%Y%m%d.%H%M)"
+
+  backup_script kx
+  download_kx
+  exec "${kx_path}" setup --update
+}
+
+function do_self_destruct() {
+  local resp verbose
+  verbose=true
+
+  if "${force}"; then
+    resp="YES"
+  else
+    read -r -p "Type YES to remove the kx install and all Elixir versions: " resp
+  fi
+
+  if [[ "${resp}" != YES ]]; then
+    info "Aborting kx self destruct."
+    halt
+  fi
+
+  [[ -d "${KX_HOME}" ]] && rm -rf "$KX_HOME"
+
+  info "You can now remove the kx source lines from your startup script(s)."
+  info "They look like:"
+
+  local script
+  script="$(printable_script "${scripts_path}/kx")"
+
+  info "\ttest -s \"${script}.bash\" && source \"${script}.bash\" # bash / zsh"
+  info "\ttest -s \"${script}.csh\" && source \"${script}.csh\" # csh / tcsh"
+  info "\ttest -s \"${script}.fish\" && source \"${script}.fish\" # fish"
+}
+
+function usage_self() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx self COMMAND
+
+Commands:
+\tupdate                    Downloads and Updates kx
+\tdestruct                  Removes kx and all installed Elixirs
+USAGE
+}
+
+function do_self() {
+  if (($#)); then
+    case "$1" in
+    --help | -h | -\? | help) halt usage: self ;;
+    update) do_self_update ;;
+    destruct) do_self_destruct ;;
+    esac
+  else
+    halt 1 usage: self
+  fi
+}
+
+function do_list_branches_cached() {
+  local cache_file repo
+
+  for cache_file in "${base_path}"/.cached_branches.*; do
+    repo="${cache_file##${base_path}/.cached_branches.}"
+    info "Elixir branches for ${repo/_//}:"
+    jq_filter "${cache_file}" __raw | indent_values | sort -V
+    info ""
+  done
+}
+
+function usage_list_branches() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx list branches [OWNER[/REPOSITORY]]|[--cached|-C]
+
+Shows available Elixir branches. By default, shows only the elixir-lang/elixir
+repository on GitHub. If OWNER is provided, will show branches on OWNER/elixir;
+if OWNER/REPOSITORY is provided, will show branches on that repository.
+
+If --cached is provided, all cached branches from all repositories will be
+shown.
+USAGE
+}
+
+function do_list_branches() {
+  if (($#)); then
+    if [[ "$1" =~ ^--cached$ ]] || [[ "$1" =~ ^-C$ ]]; then
+      do_list_branches_cached
+      return $?
+    elif [[ "$1" =~ ^[[:alnum:]_]+/[[:alnum:]_]+$ ]]; then
+      elixir_repo="$1"
+      shift
+    elif [[ "$1" =~ ^[[:alnum:]_]+$ ]]; then
+      elixir_repo="$1/elixir"
+      shift
+    else
+      halt 1 "kx list branches unknown parameter: $1"
+    fi
+  fi
+
+  cache_needs_refresh branches && info "Getting branches from ${elixir_repo}\n"
+
+  info "Elixir branches for ${elixir_repo}:"
+  printf "%b" "$(get_elixir_branches)\n"
+}
+
+function usage_list_releases() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx list releases [--release-only|-R]|[--prerelease-only|-P]
+
+Shows available Elixir releases. By default, shows all releases. If
+--release-only or --prerelease-only are provided, only those releases are
+included. Releases are always listed from the elixir-lang/elixir repository
+on GitHub.
+
+Options:
+\t--release-only, -R        Filters releases to exclude prereleases
+\t--prerelease-only, -P     Filters releases to include only prereleases
+USAGE
+}
+
+function do_list_releases() {
+  cache_needs_refresh releases && info "Getting releases from ${default_repo}\n"
+  info "Known Elixir releases:"
+  printf "%b" "$(get_elixir_releases "$@")\n"
+}
+
+function do_install_latest() {
+  if (($#)); then
+    case "$1" in
+    --help | -h | -\? | help) halt usage:_install ;;
+    esac
+  fi
+
+  info "Getting latest release from ${default_repo}\n"
+
+  local latest_release
+  latest_release="$(get_latest_elixir_release)"
+
+  if "${force}"; then
+    REPLY=Y
+  else
+    read -p "Do you want to install ${latest_release}? [y/N]" -n 1 -r
+  fi
+
+  [[ $REPLY =~ ^[Yy]$ ]] && do_install_elixir "${latest_release}" "$@"
+}
+
+function do_install_elixir() {
+  local version erlang_version owner repo branch use_git
+  version="$1"
+  branch=master
+  repo=elixir
+  use_git=false
+
+  if [[ "${version}" =~ ^([-[:alnum:]_]+)/([-[:alnum:]_]+)@(.+)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    branch="${BASH_REMATCH[3]}"
+  elif [[ "${version}" =~ ^([-[:alnum:]_]+)@(.+)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    branch="${BASH_REMATCH[2]}"
+  elif [[ "${version}" =~ ^([-[:alnum:]_]+)/([-[:alnum:]_]+)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  elif [[ "${version}" =~ v?([[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+(-[[:alnum:]]+\.[[:digit:]]+)?) ]]; then
+    version="${BASH_REMATCH[1]}"
+  fi
+
+  if ((${#owner} > 1)); then
+    elixir_repo="${owner}/${repo}"
+    version="${branch}"
+
+    if ! valid_branch "${version}"; then
+      halt 1 "Unknown Elixir branch ${elixir_repo}@${branch}."
+    fi
+
+    use_git=true
+  elif valid_version "${version}"; then
+    use_git=false
+  elif valid_branch "${version}"; then
+    use_git=true
+  else
+    halt 1 "Unknown Elixir release or branch ${version}."
+  fi
+
+  check_minimum_erlang_release "${version}"
+  erlang_version="$(erlv_full)"
+
+  [[ -z "${erlang_version}" ]] && erlang_version="${erlv}"
+
+  local name install_path version_path
+  name="${2:-${version}}"
+  version_path="elixir-${name}-otp-${erlang_version}"
+  install_path="${elixirs_path}/${version_path}"
+
+  if [[ -f "${install_path}/bin/elixir" ]] && ! "${reinstall}"; then
+    halt 1 "There is a version of Elixir already installed as ${name}."
+  fi
+
+  cd "${build_path}" || build_failure "cd ${build_path}"
+
+  info "Downloading Elixir version ${version}."
+
+  if "${use_git}"; then
+    build_elixir_repository
+  else
+    build_elixir_tarball
+  fi
+}
+
+function usage_install() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx install [VERSION|latest] [AS]
+
+Installs the specified version of Elixir. VERSION may be specified as:
+
+- a release tag from elixir-lang/elixir;
+- a branch from elixir-lang/elixir;
+- a branch from another Elixir repository, as owner/repo@branch;
+  - owner@branch means owner/elixir@branch
+  - owner/repo means owner/repo@master
+- 'latest', which will prompt to install the latest released version from
+  elixir-lang/elixir (no prerelease versions are included).
+
+An installation will be installed using the version of Erlang used to build it.
+An alternative version name may be specified.
+
+Examples (using Erlang/OTP 22.3.2):
+
+  kx install 1.11.1               # Installs elixir-1.11.1-otp-22.3.2
+  kx install master               # Installs elixir-master-otp-22.3.2
+  kx install owner@master         # Installs elixir-master-otp-22.3.2
+  kx install owner/repo           # Installs elixir-master-otp-22.3.2
+  kx install owner/repo@other     # Installs elixir-other-otp-22.3.2
+  kx install owner/repo@other 13  # Installs elixir-13-otp-22.3.2
+
+Installation will fail if the same version is already installed.
+USAGE
+}
+
+function do_install() {
+  if ((!$#)); then
+    halt 1 usage: install
+  fi
+
+  local version
+  version="$1"
+  shift
+
+  case "${version}" in
+  --help | -\? | -h | help) halt usage: install ;;
+  latest) do_install_latest "$@" ;;
+  v0.*) halt 1 "kx does not support Elixirs before v1.0.0." ;;
+  *) do_install_elixir "${version}" "$@" ;;
+  esac
+}
+
+function usage_reinstall() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx reinstall VERSION
+
+Reinstalls the specified version of Elixir. VERSION may be specified as the
+managed Elixir version name or a full Elixir and Erlang/OTP specifier. The
+VERSION must be installed under any Erlang/OTP version.
+USAGE
+}
+
+function do_reinstall() {
+  (($#)) || halt 1 usage: reinstall
+
+  local target version match name
+  local -a installed
+  target="$1"
+  shift
+
+  case "${target}" in
+  --help | -\? | -h | help) halt usage: reinstall ;;
+  esac
+
+  # shellcheck disable=SC2207
+  installed=($(installed_elixirs | sort -Vr))
+
+  for version in "${installed[@]}"; do
+    [[ -f "${elixirs_path}/${version}/.kx-version" ]] || continue
+
+    if [[ "${version}" == "${target}" ]] || [[ "${version}" =~ ^elixir-${target}-otp- ]]; then
+      match="${elixirs_path}/${version}/.kx-version"
+      break
+    fi
+  done
+
+  if ((!${#match})); then
+    halt 1 "No matching version found for '${target}'."
+  fi
+
+  info "Reinstalling ${target}"
+
+  version="$(jq -r .version <"${match}")" || halt 1 "Error reading version from ${match}"
+  name="$(jq -r .name <"${match}")" || halt 1 "Error reading name from ${match}"
+  reinstall=true do_install_elixir "${version}" "${name}"
+}
+
+function usage_uninstall() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx uninstall VERSION [OPTIONS]
+
+Uninstalls the specified version of Elixir. VERSION may be specified as the
+managed Elixir version name or a full Elixir and Erlang/OTP specifier.
+
+If only the managed Elixir version name is included, the Erlang/OTP version will
+be based on the currently active version of Erlang/OTP. All Elixir versions for
+a given name can be deleted by providing '--otp all'.
+
+Options:
+\t--otp all                 Removes all versions of the named Elixir.
+\t--otp VERSION             Removes versions of the named Elixir matching the
+                            provided Erlang/OTP version.
+
+Examples:
+
+  # Uninstalls elixir-1.11.1-otp-22.3.2
+  kx uninstall 1.11.1
+  # Uninstalls elixir-1.11.1-otp-22.3.2 and elixir-1.11.1-otp-23.1.0
+  kx uninstall 1.11.1 --otp all
+  # Uninstalls elixir-1.11.1-otp-22.3.2
+  kx uninstall 1.11.1 --otp 22
+
+Uninstallation will fail if there is no matching Elixir version found or if the
+only Elixir to be removed would be the current Elixir version.
+
+If more than one Elixir can be removed, the command will succeed, but the
+current Elixir will not be removed.
+
+If one of the removed Elixir versions is the default Elixir version, the default
+Elixir version will be cleared.
+USAGE
+}
+
+function do_uninstall() {
+  local target version otp_version default match current
+  local -a installed found
+  otp_version="$(erlv_full)"
+  default="$(default_elixir)"
+  current="$(current_elixir)"
+  # shellcheck disable=SC2207
+  installed=($(installed_elixirs))
+  found=()
+
+  while (($#)); do
+    case "$1" in
+    --help | -h | -\? | help) halt usage: uninstall ;;
+    --otp)
+      if [[ "$2" =~ ^[[:digit:]][[:digit:]][[:digit:].]*$ ]]; then
+        otp_version="$2"
+        shift
+      elif [[ "$2" == all ]]; then
+        otp_version=
+        shift
+      elif [[ -z "$2" ]]; then
+        halt 1 "No Erlang version specified for --otp."
+      else
+        halt 1 "Invalid Erlang version $2."
+      fi
+      ;;
+    *) found=("${found[@]}" "$1") ;;
+    esac
+    shift
+  done
+
+  set -- "${found[@]}"
+
+  (($#)) || halt 1 usage: uninstall
+
+  target="$1"
+  found=()
+  shift
+
+  for version in "${installed[@]}"; do
+    match=false
+    [[ "${version}" == "${target}" ]] && match=true
+    [[ "${version}" =~ elixir-"${target}"-otp-"${otp_version}" ]] && match=true
+
+    "${match}" || continue
+
+    found=("${found[@]}" "${version}")
+  done
+
+  ((${#found[@]})) || halt 1 "Elixir version ${version} could not be found."
+
+  for version in "${found[@]}"; do
+    if [[ "${version}" == "${current}" ]]; then
+      error "'${version}' is the current Elixir version. " \
+        "Please set kx to use another version and try again."
+      ((${#found[@]} == 1)) && halt 1
+    fi
+
+    [[ "${version}" == "${default}" ]] && do_default --clear
+
+    info "Uninstalling Elixir ${version}"
+
+    rm -Rf \
+      "${elixirs_path:?}/${version}.env.fish" \
+      "${elixirs_path:?}/${version}.env.csh" \
+      "${elixirs_path:?}/${version}.env" \
+      "${elixirs_path:?}/${version}" \
+      "${mix_archives_path:?}/${version}"
+  done
+}
+
+function usage_use() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx use [VERSION] [--otp-major]
+
+Uses the specified installed version of Elixir. VERSION may be specified as the
+managed Elixir version name or a full Elixir and Erlang/OTP specifier.
+
+If VERSION is not specified, kx will look for '.elixir-version'. The version
+should be the same format as described above.
+
+If --otp-major is specified and the installation is not a full specifier, the
+Erlang/OTP version will be matched based on the major version.
+USAGE
+}
+
+function do_use() {
+  if (($#)); then
+    case "$1" in
+    --help | -h | -\? | help) halt usage: use ;;
+    esac
+  fi
+
+  local version
+  version="$(find_elixir_version "${@}")" || halt $?
+
+  local script
+  script="$(printable_Script "${elixirs_path}/${version}.env")"
+
+  info "To switch Elixir versions for your current shell, run:\n"
+
+  if [[ "${usershell}" = fish ]]; then
+    printf "\t%s\n" "source ${script}.fish"
+  elif [[ "${usershell}" = csh ]]; then
+    printf "\t%s\n" "source ${script}.csh"
+  else
+    printf "\t%s\n" "source ${script}"
+  fi
+}
+
+function usage_shell() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx shell VERSION [--otp-major]
+
+Starts a sub-shell with the specified installed version of Elixir. VERSION may
+be specified as the managed Elixir version name or a full Elixir and Erlang/OTP
+specifier.
+
+If VERSION is not specified, kx will look for '.elixir-version'. The version
+should be the same format as described above.
+
+If --otp-major is specified and the installation is not a full specifier, the
+Erlang/OTP version will be matched based on the major version.
+USAGE
+}
+
+function do_shell() {
+  if (($#)); then
+    case "$1" in
+    --help | -h | -\? | help) halt usage: shell ;;
+    esac
+  fi
+
+  local version
+  version="$(find_elixir_version "${@}")" || halt $?
+
+  info "Starting sub-shell with Elixir version ${version}"
+  # shellcheck disable=SC1090
+  source "${elixirs_path}/${version}.env"
+  exec "${SHELL}"
+}
+
+function usage_default() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx default VERSION|--clear [--otp-major]
+
+If VERSION is provided, sets the default version of Elixir to the installed
+version of Elixir. VERSION may be specified as the managed Elixir version name
+or a full Elixir and Erlang/OTP specifier.
+
+If --clear is provided, removes the default version of Elixir.
+
+If VERSION is not specified, kx will look for '.elixir-version'. The version
+should be the same format as described above.
+
+If --otp-major is specified and the installation is not a full specifier, the
+Erlang/OTP version will be matched based on the major version.
+USAGE
+}
+
+function do_clear_default() {
+  info "Cleared default Elixir version."
+  rm -f "${elixirs_path:?}/.default" "${elixirs_path:?}/.default.csh" \
+    "${elixirs_path:?}/.default.fish"
+}
+
+function do_default() {
+  if (($#)); then
+    case "$1" in
+    --help | -h | -\? | help) halt usage: default ;;
+    --clear)
+      do_clear_default
+      halt $?
+      ;;
+    esac
+  fi
+
+  local version
+  version="$(find_elixir_version "${@}")" || halt $?
+
+  if [[ -e "${elixirs_path}"/.default ]]; then
+    if [[ -L "${elixirs_path}"/.default ]]; then
+      quiet=true do_clear_default
+    else
+      halt 1 "The file ${elixirs_path}/.default should not exist. Delete and try again."
+    fi
+  fi
+
+  ln -sF "${elixirs_path}/${version}.env" "${elixirs_path}/.default"
+  ln -sF "${elixirs_path}/${version}.env.csh" "${elixirs_path}/.default.csh"
+  ln -sF "${elixirs_path}/${version}.env.fish" "${elixirs_path}/.default.fish"
+
+  info "Default Elixir version set to ${version}."
+}
+
+function current_elixir() {
+  local iexpath current
+
+  iexpath="$(command -v iex)"
+
+  if [[ -n "${iexpath}" ]]; then
+    current="${iexpath/\/bin\/iex/}"
+    current="${current/${elixirs_path}\//}"
+  fi
+
+  echo "${current}"
+}
+
+function installed_elixirs() {
+  find "${elixirs_path}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null |
+    sed -E "s!${elixirs_path}/!!g" | sort -V
+}
+
+function default_elixir() {
+  [[ -L "${elixirs_path}"/.default ]] &&
+    grep ELIXIR_VERSION= "${elixirs_path}/.default" | sed -E 's/^.*"([^"]+)"$/\1/'
+}
+
+function do_list_installed() {
+  local current default version otp_version
+  local -i total
+  local -a installed
+
+  if (($#)); then
+    case "$1" in
+    --help | -\? | -h | help)
+      halt usage: list installed
+      ;;
+    --otp)
+      if [[ "$2" =~ ^[[:digit:]][[:digit:]][[:digit:].]*$ ]]; then
+        otp_version="$2"
+      else
+        otp_version="$(erlv_full)"
+      fi
+      ;;
+    esac
+  fi
+
+  default="$(default_elixir)"
+  # shellcheck disable=SC2207
+  installed=($(installed_elixirs))
+  total="${#installed[@]}"
+
+  info "kx - Installed Elixir versions\n"
+
+  if ((total == 0)); then
+    info "No kx Elixirs installed yet. Try 'kx install <VERSION>'"
+    halt
+  fi
+
+  if ((${#otp_version})); then
+    local -a filtered
+    filtered=()
+
+    for version in "${installed[@]}"; do
+      [[ "${version}" =~ otp-"${otp_version}" ]] &&
+        filtered=("${filtered[@]}" "${version}")
+    done
+
+    installed=("${filtered[@]}")
+  fi
+
+  if ((${#installed[@]} == 0 && ${#otp_version})); then
+    info "No kx Elixirs match OTP version ${otp_version}."
+    halt
+  else
+    printf "%5s\t%-20s\t%-10s\t%-30s\n" " " "Name" "OTP Version" \
+      "Full Version" " " "----" "-----------" "------------"
+  fi
+
+  current="$(current_elixir)"
+
+  for version in "${installed[@]}"; do
+    local flags readable otp
+    local -i flags_width
+    flags=
+    readable=
+    otp=
+
+    [[ -x "${elixirs_path}/${version}/bin/elixir" ]] || continue
+
+    if [[ "${version}" == "${current}" ]] && [[ "${version}" == "${default}" ]]; then
+      flags="*=>"
+    elif [[ "${version}" == "${current}" ]]; then
+      flags="=>"
+    elif [[ "${version}" == "${default}" ]]; then
+      flags="=>"
+    fi
+
+    flags_width=$(((5 - ${#flags}) / 2 + ${#flags}))
+
+    if [[ "${version}" =~ ^elixir-(.+)-otp-(.+)$ ]]; then
+      readable="${BASH_REMATCH[1]}"
+      otp="${BASH_REMATCH[2]}"
+    fi
+
+    printf "%*s\t%-20s\t%-10s\t%-30s\n" "${flags_width}" "${flags}" \
+      "${readable}" "${otp}" "${version}"
+  done
+
+  [[ -z "${default}" ]] &&
+    info "\n# Default Elixir not set. Try 'kx default <VERSION>'"
+
+  info <<INFO
+
+#  => - current Elixir
+# *=> - current and default Elixir
+# *   - default Elixir
+
+INFO
+}
+
+function usage_list_installed() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx list installed [OPTIONS]
+
+Shows Elixir installations.
+
+Options:
+\t--otp [VERSION]           Filters to only show matching OTP installs; uses
+\t                          the current version if not specified
+USAGE
+}
+
+function usage_list() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx list [installed|releases|branches] [OPTIONS]
+
+Shows Elixir installations, releases, or branches.
+
+Commands:
+\tlist [installed]          Shows Elixir installations
+\tlist releases             Shows available Elixir releases
+\tlist branches             Shows available Elixir branches
+USAGE
+}
+
+function do_help_list() {
+  if (($#)); then
+    case "$1" in
+    installed | releases | branches) usage_list_"$1" ;;
+    *) usage_list ;;
+    esac
+  else
+    usage_list
+  fi
+}
+
+function do_list() {
+  local subcommand
+  subcommand="installed"
+
+  if (($#)); then
+    subcommand="$1"
+    shift
+  fi
+
+  case "${subcommand}" in
+  --help | -\? | -h) usage_list ;;
+  help) do_help_list "$@" ;;
+  installed) do_list_installed "$@" ;;
+  releases) do_list_releases "$@" ;;
+  branches) do_list_branches "$@" ;;
+  esac
+}
+
+function usage() {
+  local verbose
+  verbose=true
+
+  if (($#)); then
+    local parts
+    parts="$(echo "${*}" | tr ' ' '_')"
+
+    if has_function usage_"${parts}"; then
+      usage_"${parts}"
+      return
+    fi
+  fi
+
+  info <<USAGE
+${kx_banner}
+
+Usage: kx [OPTIONS] COMMAND...
+
+Options:
+\t--quiet, -q               Silences non-error messages
+\t--verbose, -v             Always shows non-error messages (overrides -q)
+\t--force, -f               Forces completion of a step can be forced
+\t--help, -h, -\?           Shows this help; or the help of a command or
+\t                          subcommand if used there.
+
+Commands:
+\tlist [installed]          Shows kx-managed Elixir versions
+\tlist releases             Shows available Elixir releases
+\tlist branches             Shows available Elixir branches
+\tinstall VERSION [AS]      Installs the given release version
+\treinstall VERSION         Reinstalls the given release version
+\tuninstall VERSION         Uninstalls the given release version
+\tuse VERSION               Uses the given version for this shell
+\tshell VERSION             Uses the given version for this shell
+\tdefault VERSION|--clear   Manages the default Elixir version
+\tdoctor                    Checks whether kx can be used
+\tself update               Downloads and Updates kx
+\tself destruct             Removes kx and all installed Elixirs
+USAGE
+}
+
+function do_help() {
+  (($#)) || halt usage:
+
+  local parts
+  local -a args
+  args=()
+
+  while (($#)); do
+    case "$1" in
+    -*) : ;;
+    *) args=("${args[@]}" "$1") ;;
+    esac
+    shift
+  done
+
+  set -- "${args[@]}"
+
+  while (($#)); do
+    parts="$(echo "${*}" | tr ' ' '_')"
+    if has_function usage_"${parts}"; then
+      usage_"${parts}"
+      halt $?
+    fi
+
+    set -- "${@:1:$(($# - 1))}"
+  done
+
+  error "Error: unknown help topic ${args[*]}.\n"
+  usage
+}
+
+function main() {
+  (($#)) || halt 1 usage:
+
+  local -a args
+  while (($#)); do
+    case "$1" in
+    --quiet | -q) quiet=true ;;
+    --verbose | -v) verbose=true ;;
+    --force | -f) force=true ;;
+    --update | -U) update=true ;;
+    --install | -I) do_install_kx ;;
+    --version)
+      printf "%s\n" "${kx_version}"
+      halt
+      ;;
+    *) args=("${args[@]}" "$1") ;;
+    esac
+
+    shift
+  done
+
+  set -- "${args[@]}"
+
+  local cmd runner requires_setup
+  cmd="$1"
+  runner="do_${cmd}"
+  requires_setup=true
+  shift
+
+  case "${cmd}" in
+  default) : ;;
+  doctor) requires_setup=false ;;
+  help | --help | -h | -\?)
+    requires_setup=false
+    runner=do_help
+    ;;
+  i | install) runner=do_install ;;
+  reinstall) runner=do_reinstall ;;
+  ls | list) runner=do_list ;;
+  sh | shell) runner=do_shell ;;
+  un | uninstall) runner=do_uninstall ;;
+  use) : ;;
+  setup | self) requires_setup=false ;;
+  *)
+    error "Error: Unknown command ${cmd}.\n"
+    usage >&2
+    halt 1
+    ;;
+  esac
+
+  "${requires_setup}" && do_doctor --only-errors
+  "${runner}" "$@"
+}
+
+main "$@"
