@@ -2,12 +2,12 @@
 
 declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
 
+kx_version="1.0.0-rc.3"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 KX_HOME="$(
   cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
   pwd -P
 )/$(basename "${KX_HOME:-${data_home}/kx}")"
-kx_version="1.0.0-rc.2"
 kx_user_agent="kx-elixir-installer ${kx_version}"
 kx_issues_url="https://github.com/halostatue/kx/issues/new"
 kx_url="https://raw.githubusercontent.com/halostatue/kx/main/kx"
@@ -567,11 +567,13 @@ function find_elixir_version() {
   while (($#)); do
     case "$1" in
     --otp-major) otp_version="${erlv}" ;;
-    *) : ;;
+    *) args=("${args[@]}" "$1") ;;
     esac
 
     shift
   done
+
+  set -- "${args[@]}"
 
   if (($#)); then
     target="$1"
@@ -1330,7 +1332,7 @@ function do_source() {
   version="$(find_elixir_version "${@}")" || halt $?
 
   local script
-  script="$(printable_script "${elixirs_path}/${version}.env")"
+  script="${elixirs_path}/${version}.env"
 
   if [[ "${usershell}" = fish ]]; then
     echo "${script}.fish"
