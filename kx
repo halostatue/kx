@@ -853,9 +853,9 @@ function do_setup() {
   fi
 
   if "${update}"; then
-    info "\nkx installed in ${KX_HOME} is now updated."
+    info "\nkx installed in ${KX_HOME} is now updated to ${kx_version}."
   else
-    info "\nkx has been installed in ${KX_HOME}."
+    info "\nkx ${kx_version} has been installed in ${KX_HOME}."
   fi
 }
 
