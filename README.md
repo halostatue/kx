@@ -56,6 +56,7 @@ curl -sSL https://raw.githubusercontent.com/halostatue/kx/main/install |
 - `kx uninstall VERSION`: Uninstalls the given release version
 - `kx use VERSION`: Uses the given version for this shell
 - `kx shell VERSION`: Uses the given version for this shell
+- `kx source VERSION`: Prints the script to load for this version
 - `kx default VERSION|--clear`: Manages the default Elixir version
 - `kx doctor`: Checks whether kx can be used
 - `kx self update`: Downloads and Updates kx
