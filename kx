@@ -340,23 +340,33 @@ function create_kx_env_script_bash() {
   backup_script "${scripts_path}/kx.bash"
 
   cat >"${scripts_path}/kx.bash" <<"EOF"
-KX_HOME="${KX_HOME:-${HOME}/.kx}"
+KX_HOME="${KX_HOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/kx}"
 export PATH="${KX_HOME}/bin:${PATH}"
 [[ -f "${KX_HOME}"/elixirs/.default ]] && source "${KX_HOME}"/elixirs/.default
 
 function kx() {
-  if [[ "$1" = "use" ]]; then
-    source_line="$(USERSHELL=notcsh "${KX_HOME}"/bin/kx "$[@]" | grep source)"
-    if [[ -z "${source_line}" ]]; then
-      echo "Failed to ${*}" >&2
-      return 1
-    else
-      eval "${source_line}"
+  if (($#)); then
+    if [[ "$1" = "use" ]]; then
       shift
+
+      local source_line
+      source_line="$(USERSHELL=notcsh "${KX_HOME}"/bin/kx source "${@}")" || {
+        echo >&2 "Failed to use ${*}"
+        return 1
+      }
+
+      if [[ -z "${source_line}" ]]; then
+        echo >&2 "Failed to use ${*}"
+        return 1
+      fi
+
       echo "Using ${*}"
+      source "${source_line}"
+    else
+      "${KX_HOME}/bin/kx" "$@"
     fi
   else
-    "${KX_HOME}/bin/kx" "$@"
+    "${KX_HOME}/bin/kx"
   fi
 }
 EOF
@@ -367,7 +377,11 @@ function create_kx_env_script_csh() {
 
   cat >"${scripts_path}/kx.csh" <<"EOF"
 if ( ! $?KX_HOME ) then
-  setenv KX_HOME="$HOME/.kx"
+  if ( $?XDG_DATA_HOME ) then
+    setenv KX_HOME="$XDG_DATA_HOME/kx"
+  else
+    setenv KX_HOME="$HOME/.local/share/kx"
+  end
 endif
 setenv PATH "$KX_HOME/bin:$PATH"
 
@@ -381,24 +395,28 @@ function create_kx_env_script_fish() {
   backup_script "${scripts_path}/kx.fish"
 
   cat >"${scripts_path}/kx.fish" <<"EOF"
-set -q KX_HOME; or set KX_HOME $HOME/.kx
+if ! set -q KX_HOME
+    if set -q XDG_DATA_HOME
+        set -g KX_HOME $XDG_DATA_HOME/kx
+    else
+        set -g KX_HOME $HOME/.local/share/kx
+    end
+end
+
 set -gx PATH $KX_HOME/bin $PATH
 
-if test -f $KX_HOME/elixirs/.default.fish
-  source $KX_HOME/elixirs/.default.fish
-end
+test -f $KX_HOME/elixirs/.default.fish; and source $KX_HOME/elixirs/.default.fish
 
 function kx
     if set -q argv[1]; and test $argv[1] = use
+        set -e argv[1]
         set -lx USERSHELL $SHELL
-        set -l source_line ($KX_HOME/bin/kx $argv | string match -e source)
 
-        if test -z "$source_line"
-            echo "Failed to $argv" >&2
+        if ! set -l source_line ($KX_HOME/bin/kx source $argv); or test -z "$source_line"
+            echo "Failed to use $argv" >&2
             return 1
         else
-            eval $source_line
-            set -e argv[1]
+            source $source_line
             echo "Using $argv"
         end
     else
@@ -1268,7 +1286,7 @@ function do_use() {
   version="$(find_elixir_version "${@}")" || halt $?
 
   local script
-  script="$(printable_Script "${elixirs_path}/${version}.env")"
+  script="$(printable_script "${elixirs_path}/${version}.env")"
 
   info "To switch Elixir versions for your current shell, run:\n"
 
@@ -1278,6 +1296,48 @@ function do_use() {
     printf "\t%s\n" "source ${script}.csh"
   else
     printf "\t%s\n" "source ${script}"
+  fi
+}
+
+function usage_source() {
+  info <<USAGE
+${kx_banner}
+
+Usage: kx source [VERSION] [--otp-major]
+
+Prints the file to source in order to use the specified installed version of
+Elixir. This function is mostly used for automation and scripting. If the
+version is not found, no value will be printed and kx will exit with an error
+state.
+
+VERSION may be specified as the managed Elixir version name or a full
+Elixir and Erlang/OTP specifier. If VERSION is not specified, kx will look for
+'.elixir-version'. The version should be the same format as described above.
+
+If --otp-major is specified and the installation is not a full specifier, the
+Erlang/OTP version will be matched based on the major version.
+USAGE
+}
+
+function do_source() {
+  if (($#)); then
+    case "$1" in
+    --help | -h | -\? | help) halt usage: source ;;
+    esac
+  fi
+
+  local version
+  version="$(find_elixir_version "${@}")" || halt $?
+
+  local script
+  script="$(printable_script "${elixirs_path}/${version}.env")"
+
+  if [[ "${usershell}" = fish ]]; then
+    echo "${script}.fish"
+  elif [[ "${usershell}" = csh ]]; then
+    echo "${script}.csh"
+  else
+    echo "${script}"
   fi
 }
 
@@ -1579,7 +1639,8 @@ Commands:
 \treinstall VERSION         Reinstalls the given release version
 \tuninstall VERSION         Uninstalls the given release version
 \tuse VERSION               Uses the given version for this shell
-\tshell VERSION             Uses the given version for this shell
+\tshell VERSION             Uses the given version for a new shell
+\tsource VERSION            Prints the given version in a shell
 \tdefault VERSION|--clear   Manages the default Elixir version
 \tdoctor                    Checks whether kx can be used
 \tself update               Downloads and Updates kx
@@ -1657,10 +1718,11 @@ function main() {
   i | install) runner=do_install ;;
   reinstall) runner=do_reinstall ;;
   ls | list) runner=do_list ;;
+  setup | self) requires_setup=false ;;
   sh | shell) runner=do_shell ;;
+  source) runner=do_source ;;
   un | uninstall) runner=do_uninstall ;;
   use) : ;;
-  setup | self) requires_setup=false ;;
   *)
     error "Error: Unknown command ${cmd}.\n"
     usage >&2
