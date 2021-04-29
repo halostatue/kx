@@ -2,7 +2,7 @@
 
 declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
 
-kx_version="1.0.0-rc.3"
+kx_version="1.0.0-beta.4"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 KX_HOME="$(
   cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
@@ -435,7 +435,7 @@ function kx
                 return 0
             case self
                 set -e argv[1]
-                if set -q argv[1] && test $argv[1] == cd
+                if set -q argv[1]; and test $argv[1] = cd
                     set -e argv[1]
                     cd ($KX_HOME/bin/kx self home)
                     return 0
