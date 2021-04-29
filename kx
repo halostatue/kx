@@ -7,7 +7,7 @@ KX_HOME="$(
   cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
   pwd -P
 )/$(basename "${KX_HOME:-${data_home}/kx}")"
-kx_version="1.0.0"
+kx_version="1.0.0-rc.2"
 kx_user_agent="kx-elixir-installer ${kx_version}"
 kx_issues_url="https://github.com/halostatue/kx/issues/new"
 kx_url="https://raw.githubusercontent.com/halostatue/kx/main/kx"
@@ -786,12 +786,12 @@ function do_setup() {
   done
 
   if ((${#source_found})); then
-    info "Kx sourcing line found in:"
+    info "kx sourcing line found in:\n"
     for arg in "${source_found[@]}"; do
       info "\t- ${arg}"
     done
   else
-    info "Kx sourcing line not found in any of:"
+    info "kx sourcing line not found in any of:\n"
     info "\t- ~/.bashrc"
     info "\t- ~/.bash_profile"
     info "\t- ~/.profile"
