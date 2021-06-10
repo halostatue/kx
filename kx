@@ -2,7 +2,7 @@
 
 declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
 
-kx_version="1.0.0-beta.6"
+kx_version="1.0.0-beta.7"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 KX_HOME="$(
   cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
@@ -806,10 +806,10 @@ function do_setup() {
   source_found=()
   for arg in "${in_bashrc}" "${in_profile}" "${in_bash_profile}" "${in_zshrc}" \
     "${in_zsh_profile}" "${in_fish_config}"; do
-    source_found=("${source_found[@]}" "${arg}")
+    ((${#arg})) && source_found+=("${arg}")
   done
 
-  if ((${#source_found})); then
+  if ((${#source_found[@]})); then
     info "kx sourcing line found in:\n"
     for arg in "${source_found[@]}"; do
       info "\t- ${arg}"
@@ -837,7 +837,7 @@ function do_setup() {
     create_build_env_files
   done
 
-  if ((!${#found[@]})); then
+  if ((!${#source_found[@]})); then
     info "\nAdd the following to your shell's config file:\n"
 
     local script
