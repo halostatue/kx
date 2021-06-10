@@ -1,6 +1,6 @@
 # kx Changelog
 
-## 1.0.0 / 2021-04-30
+## 1.0.0 / 2021-06-11
 
 - Forked from [taylor/kiex]. See the [rationale](RATIONALE.md).
 - Formatted with `shfmt` and checked for issues with `shellcheck`.
