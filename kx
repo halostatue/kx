@@ -2,7 +2,7 @@
 
 declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
 
-kx_version="1.0.0-beta.7"
+kx_version="1.0.0-beta.8"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 KX_HOME="$(
   cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
@@ -33,7 +33,7 @@ build_path="${base_path}/builds"
 scripts_path="${base_path}/scripts"
 elixirs_path="${base_path}/elixirs"
 mix_archives_path="${base_path}/mix/archives"
-mix_archives_source_path="$(printable_script "${KX_HOME}/mix/archives}")"
+mix_archives_source_path="$(printable_script "${KX_HOME}/mix/archives")"
 default_repo=elixir-lang/elixir
 erl="$(command -v erl)"
 erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
@@ -335,6 +335,10 @@ function backup_script() {
   if [[ -f "$1" ]] && [[ -n "${backup}" ]]; then
     cp "$1" "$1.bak.${backup}"
   fi
+}
+
+function clean_up_backups() {
+  find "${KX_HOME}" -name \*.bak.\* --exec rm {} \;
 }
 
 function create_kx_env_script_bash() {
@@ -857,6 +861,8 @@ function do_setup() {
   else
     info "\nkx ${kx_version} has been installed in ${KX_HOME}."
   fi
+
+  clean_up_backups
 }
 
 function do_self_home() {
