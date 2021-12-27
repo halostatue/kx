@@ -36,7 +36,6 @@ mix_archives_path="${base_path}/mix/archives"
 mix_archives_source_path="$(printable_script "${KX_HOME}/mix/archives")"
 default_repo=elixir-lang/elixir
 erl="$(command -v erl)"
-erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
 
 # Running bash -l from csh does not change $SHELL
 shellname="$(basename "${SHELL}")"
@@ -1788,6 +1787,7 @@ function main() {
   esac
 
   "${requires_setup}" && do_doctor --only-errors
+  erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
   "${runner}" "$@"
 }
 
