@@ -1787,7 +1787,10 @@ function main() {
   esac
 
   "${requires_setup}" && do_doctor --only-errors
-  erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
+
+  [[ -z "${erl}" ]] &&
+    erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
+
   "${runner}" "$@"
 }
 
