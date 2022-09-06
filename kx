@@ -2,7 +2,7 @@
 
 declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
 
-kx_version="1.0.0-beta.10"
+kx_version="1.0.0-beta.11"
 # bin_home="${XDG_DATA_HOME:-${HOME}/.local/bin}"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 KX_HOME="$(
@@ -344,7 +344,7 @@ function backup_script() {
 }
 
 function clean_up_backups() {
-  find "${KX_HOME}" -name \*.bak.\* --exec rm {} \;
+  find "${KX_HOME}" -name \*.bak.\* -exec rm {} \;
 }
 
 function create_kx_env_script_bash() {
