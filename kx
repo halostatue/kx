@@ -2,7 +2,8 @@
 
 declare kx_version kx_user_agent kx_issues_url kx_url kx_banner data_home
 
-kx_version="1.0.0-beta.9"
+kx_version="1.0.0-beta.10"
+# bin_home="${XDG_DATA_HOME:-${HOME}/.local/bin}"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 KX_HOME="$(
   cd "$(dirname "${KX_HOME:-${data_home}/kx}")" || builtin exit 1
@@ -24,7 +25,7 @@ function printable_script() {
 
 declare base_path bin_path kx_path build_path scripts_path elixirs_path \
   mix_archives_path mix_archives_source_path usershell system default_repo \
-  erlv erl shellname
+  erl shellname
 
 base_path="${KX_HOME}"
 bin_path="${base_path}/bin"
@@ -270,9 +271,14 @@ or load the Elixir environment file with:
 INFO
 }
 
+function erlv() {
+  erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell
+}
+
 function erlv_full() {
-  local e f
+  local e f erlv
   local -a ff
+  erlv="$(erlv)"
   e="$(dirname "$(dirname "${erl}")")"
   ff=(
     "${e}/releases/${erlv}/OTP_VERSION"
@@ -301,13 +307,14 @@ function check_minimum_erlang_release() {
   1.6.* | v1.6.* | 1.7.* | v1.7.*) low=19 ;;
   1.8.* | v1.8.* | 1.9.* | v1.9.*) low=20 ;;
   1.10.* | v1.10.* | 1.11.* | v1.11.*) low=21 ;;
-  1.12.* | v1.12.*) low=22 ;;
-  *) return 0 ;;
+  1.12.* | v1.12.* | 1.13.* | v1.13.*) low=22 ;;
+  1.14.* | v1.14.*) low=23 ;;
+  *) halt 1 "Unknown or unsupported Elixir ${elixir_version}." ;;
   esac
 
   ((high == -1)) && high=$((low + 2))
 
-  erlang_version="${erlv}"
+  erlang_version="$(erlv)"
 
   if ((erlang_version < low)); then
     halt 1 "Elixir ${elixir_version} requires at least Erlang ${low}."
@@ -590,7 +597,7 @@ function find_elixir_version() {
 
   while (($#)); do
     case "$1" in
-    --otp-major) otp_version="${erlv}" ;;
+    --otp-major) otp_version="$(erlv)" ;;
     *) args=("${args[@]}" "$1") ;;
     esac
 
@@ -954,7 +961,7 @@ function do_list_branches_cached() {
   local cache_file repo
 
   for cache_file in "${base_path}"/.cached_branches.*; do
-    repo="${cache_file##${base_path}/.cached_branches.}"
+    repo="${cache_file##"${base_path}"/.cached_branches.}"
     info "Elixir branches for ${repo/_//}:"
     jq_filter "${cache_file}" __raw | indent_values | sort -V
     info ""
@@ -1083,7 +1090,7 @@ function do_install_elixir() {
   check_minimum_erlang_release "${version}"
   erlang_version="$(erlv_full)"
 
-  [[ -z "${erlang_version}" ]] && erlang_version="${erlv}"
+  [[ -z "${erlang_version}" ]] && erlang_version="$(erlv)"
 
   local name install_path version_path
   name="${2:-${version}}"
@@ -1506,11 +1513,12 @@ function default_elixir() {
 }
 
 function do_list_installed() {
-  local current default version otp_version
+  local current default version otp_version short elixir_version
   local -i total
   local -a installed
+  short=false
 
-  if (($#)); then
+  while (($#)); do
     case "$1" in
     --help | -\? | -h | help)
       halt usage: list installed
@@ -1521,16 +1529,32 @@ function do_list_installed() {
       else
         otp_version="$(erlv_full)"
       fi
+
+      shift
+      ;;
+    --elixir)
+      if [[ "$2" =~ ^[[:digit:]][.][[:digit:]][[:digit].]*$ ]]; then
+        elixir_version="$2"
+      else
+        halt 1 "list installed option --elixir requires a version specified"
+      fi
+
+      shift
+      ;;
+    --short)
+      short=true
       ;;
     esac
-  fi
+
+    shift
+  done
 
   default="$(default_elixir)"
   # shellcheck disable=SC2207
   installed=($(installed_elixirs))
   total="${#installed[@]}"
 
-  info "kx - Installed Elixir versions\n"
+  "${short}" || info "kx - Installed Elixir versions\n"
 
   if ((total == 0)); then
     info "No kx Elixirs installed yet. Try 'kx install <VERSION>'"
@@ -1549,11 +1573,32 @@ function do_list_installed() {
     installed=("${filtered[@]}")
   fi
 
-  if ((${#installed[@]} == 0 && ${#otp_version})); then
-    info "No kx Elixirs match OTP version ${otp_version}."
+  if ((${#elixir_version})); then
+    local -a filtered
+    filtered=()
+
+    for version in "${installed[@]}"; do
+      [[ "${version}" =~ elixir-"${elixir_version}" ]] &&
+        filtered=("${filtered[@]}" "${version}")
+    done
+
+    installed=("${filtered[@]}")
+  fi
+
+  if ((!${#installed[@]})); then
+    if ((${#otp_version} && ${#elixir_version})); then
+      info "No kx Elixirs match OTP version ${otp_version} and Elixir version ${elixir_version}."
+    elif ((${#otp_version})); then
+      info "No kx Elixirs match OTP version ${otp_version}."
+    elif ((${#elixir_version})); then
+      info "No kx Elixirs match Elixir version ${elixir_version}."
+    fi
+
     halt
-  else
-    printf "%5s\t%-20s\t%-10s\t%-30s\n" " " "Name" "OTP Version" \
+  fi
+
+  if ! "${short}"; then
+    printf "%5s\t%-15s\t%-10s\t%-30s\n" " " "Name" "OTP Version" \
       "Full Version" " " "----" "-----------" "------------"
   fi
 
@@ -1568,16 +1613,6 @@ function do_list_installed() {
 
     [[ -x "${elixirs_path}/${version}/bin/elixir" ]] || continue
 
-    if [[ "${version}" == "${current}" ]] && [[ "${version}" == "${default}" ]]; then
-      flags="*=>"
-    elif [[ "${version}" == "${current}" ]]; then
-      flags="=>"
-    elif [[ "${version}" == "${default}" ]]; then
-      flags="=>"
-    fi
-
-    flags_width=$(((5 - ${#flags}) / 2 + ${#flags}))
-
     if [[ "${version}" =~ ^elixir-(.+)-otp-(.+)$ ]]; then
       readable="${BASH_REMATCH[1]}"
       otp="${BASH_REMATCH[2]}"
@@ -1585,20 +1620,45 @@ function do_list_installed() {
       continue
     fi
 
-    printf "%*s\t%-20s\t%-10s\t%-30s\n" "${flags_width}" "${flags}" \
-      "${readable}" "${otp}" "${version}"
+    if "${short}"; then
+      if [[ "${version}" == "${current}" ]] && [[ "${version}" == "${default}" ]]; then
+        flags="current\tdefault"
+      elif [[ "${version}" == "${current}" ]]; then
+        flags="current"
+      elif [[ "${version}" == "${default}" ]]; then
+        flags="default"
+      fi
+
+      printf "%s\t%s\t%s\t%s" "${readable}" "${otp}" "${version}" "${flags}"
+    else
+      if [[ "${version}" == "${current}" ]] && [[ "${version}" == "${default}" ]]; then
+        flags="*=>"
+      elif [[ "${version}" == "${current}" ]]; then
+        flags="=>"
+      elif [[ "${version}" == "${default}" ]]; then
+        flags="*"
+      fi
+
+      flags_width=$(((5 - ${#flags}) / 2 + ${#flags}))
+
+      printf "%*s\t%-15s\t%-10s\t%-30s\n" "${flags_width}" "${flags}" \
+        "${readable}" "${otp}" "${version}"
+    fi
+
   done
 
-  [[ -z "${default}" ]] &&
-    info "\n# Default Elixir not set. Try 'kx default <VERSION>'"
+  if ! "${short}"; then
+    [[ -z "${default}" ]] &&
+      info "\n# Default Elixir not set. Try 'kx default <VERSION>'"
 
-  info <<INFO
+    info <<INFO
 
 #  => - current Elixir
 # *=> - current and default Elixir
 # *   - default Elixir
 
 INFO
+  fi
 }
 
 function usage_list_installed() {
@@ -1612,6 +1672,10 @@ Shows Elixir installations.
 Options:
 \t--otp [VERSION]           Filters to only show matching OTP installs; uses
 \t                          the current version if not specified
+\t--elixir VERSION          Filters to only show matching Elixir installs.
+\t--short                   Shortens the display and moves the active and
+\t                          default Elixir markers to the end of the line.
+\t                          Suitable for scripting.
 USAGE
 }
 
@@ -1787,9 +1851,6 @@ function main() {
   esac
 
   "${requires_setup}" && do_doctor --only-errors
-
-  [[ -z "${erl}" ]] &&
-    erlv="$(erl -eval 'io:fwrite(erlang:system_info(otp_release)), halt().' -noshell)"
 
   "${runner}" "$@"
 }
