@@ -314,6 +314,7 @@ function check_minimum_erlang_release() {
   1.10.* | v1.10.* | 1.11.* | v1.11.*) low=21 ;;
   1.12.* | v1.12.* | 1.13.* | v1.13.*) low=22 ;;
   1.14.* | v1.14.*) low=23 ;;
+  1.15.* | v1.15.*) low=24 ;;
   *) halt 1 "Unknown or unsupported Elixir ${elixir_version}." ;;
   esac
 
